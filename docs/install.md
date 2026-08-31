@@ -86,6 +86,7 @@ The installer can automatically configure any of these clients:
 
 | Client | Config Written To |
 |--------|-------------------|
+| Antigravity (Google) | `~/.gemini/config/mcp_config.json`, or `~/.gemini/antigravity/mcp_config.json` if that file already exists (all platforms) |
 | Claude Desktop | `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS); `%APPDATA%\Claude\claude_desktop_config.json` (Windows, see MSIX note below) |
 | Claude Code | `.mcp.json` (project root) |
 | Cursor | `~/.cursor/mcp.json` |
@@ -141,7 +142,7 @@ The MCP server comes in two modes:
 
 | Mode | File | Tools | Best For |
 |------|------|-------|----------|
-| **Compound** (default) | `src/server.py` | 35 | Most users — fast, clean, low context usage |
+| **Compound** (default) | `src/server.py` | 36 | Most users — fast, clean, low context usage |
 | **Full** | `src/resolve_mcp_server.py` | 353 | Power users who want one tool per API method |
 
 The compound server's `timeline_item` tool includes dedicated actions for common workflows:

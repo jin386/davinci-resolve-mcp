@@ -23,10 +23,21 @@ const require = createRequire(import.meta.url);
 // ── timecode ───────────────────────────────────────────────────────────
 const TC_RE = /^(\d{2}):(\d{2}):(\d{2})[:;](\d{2,3})$/;
 export function tcToFrames(tc, fps) {
-  const m = TC_RE.exec(String(tc).trim());
+  const raw = String(tc).trim();
+  const m = TC_RE.exec(raw);
   if (!m || !fps) return null;
   const [, h, mm, s, f] = m.map(Number);
-  return Math.round((h * 3600 + mm * 60 + s) * fps) + f;
+  // SMPTE timecode counts NOMINAL frames (base 30 for 29.97, 24 for 23.976) —
+  // measured against Resolve's own GetStartFrame (Studio 19.1.3.7). The
+  // previous exact-rate product undercounted NTSC by 0.1% (108 frames/hour).
+  const nominal = Math.round(fps);
+  let frames = (h * 3600 + mm * 60 + s) * nominal + f;
+  if (raw.includes(';')) {
+    const dropped = Math.round(nominal * 0.0666666667);
+    const totalMinutes = h * 60 + mm;
+    frames -= dropped * (totalMinutes - Math.floor(totalMinutes / 10));
+  }
+  return frames;
 }
 const isTc = (t) => TC_RE.test(t);
 
@@ -38,6 +49,8 @@ function evt(o) {
   return {
     index: o.index ?? null,
     track: o.track || 'V',
+    ...(o.name !== undefined ? { name: o.name } : {}),
+    ...(o.color !== undefined ? { color: o.color } : {}),
     source: o.source || 'UNKNOWN',
     srcIn: o.srcIn ?? null,
     srcOut: o.srcOut ?? null,
@@ -72,6 +85,19 @@ export function parseEDL(text, opts = {}) {
       }
       continue;
     }
+    // Avid-style locators: `* LOC: 01:00:01:12 BLUE marker text` — a marker
+    // at an absolute record timecode. Emitted as track 'MARKER' pseudo-events
+    // (recIn only) so the assemble bridge can author them; consumers that
+    // filter video/audio by track shape ignore them.
+    const loc = /^\*\s*LOC:\s*(\d{2}:\d{2}:\d{2}[:;]\d{2})\s+(\S+)\s*(.*)$/i.exec(line);
+    if (loc) {
+      events.push(evt({
+        index: events.length + 1, track: 'MARKER', source: '',
+        recIn: tcToFrames(loc[1], fps), recOut: null,
+        name: loc[3].trim() || undefined, color: loc[2], fps,
+      }));
+      continue;
+    }
     const tokens = line.split(/\s+/);
     if (!/^\d+$/.test(tokens[0])) continue; // not an event line
     const tcs = tokens.filter(isTc);
@@ -80,7 +106,9 @@ export function parseEDL(text, opts = {}) {
     const head = tokens.slice(0, tokens.indexOf(tcs[tcs.length - 4]));
     const [eventNum, reel, channel, transition] = head;
     const dur = transition && transition !== 'C' ? Number(head[4]) : 0;
-    const track = /A/i.test(channel || '') && !/V/i.test(channel || '') ? 'A' : 'V';
+    const chan = String(channel || '');
+    const am = /^A(\d+)?$/i.exec(chan);
+    const track = am && !/V/i.test(chan) ? (am[1] && am[1] !== '1' ? `A${am[1]}` : 'A') : (/A/i.test(chan) && !/V/i.test(chan) ? 'A' : 'V');
     events.push(
       evt({
         index: Number(eventNum),
@@ -105,8 +133,24 @@ export function parseOTIO(otio, opts = {}) {
   const tracks = (doc.tracks && doc.tracks.children) || [];
   const events = [];
   let idx = 1;
+  let vNum = 0;
+  let aNum = 0;
   for (const track of tracks) {
-    const kind = track.kind === 'Audio' ? 'A' : 'V';
+    const isAudio = track.kind === 'Audio';
+    if (isAudio) aNum += 1; else vNum += 1;
+    // First track of each kind keeps the bare letter (compat); higher tracks
+    // are numbered ('V2', 'A2', …).
+    const kind = isAudio ? (aNum === 1 ? 'A' : `A${aNum}`) : (vNum === 1 ? 'V' : `V${vNum}`);
+    // Track-level markers: marked_range is already in track (record) time.
+    for (const mk of track.markers || []) {
+      const mrStart = (mk.marked_range && mk.marked_range.start_time && mk.marked_range.start_time.value) || 0;
+      const mrRate = (mk.marked_range && mk.marked_range.start_time && mk.marked_range.start_time.rate) || opts.fps || 24;
+      events.push(evt({
+        index: idx++, track: 'MARKER', source: '',
+        recIn: mrStart, recOut: null,
+        name: mk.name || undefined, color: mk.color || undefined, fps: mrRate,
+      }));
+    }
     let rec = 0;
     for (const child of track.children || []) {
       const schema = child.OTIO_SCHEMA || '';
@@ -128,6 +172,14 @@ export function parseOTIO(otio, opts = {}) {
           }
         }
         const src = (child.media_reference && (child.media_reference.target_url || child.media_reference.name)) || child.name || 'UNKNOWN';
+        for (const mk of child.markers || []) {
+          const mrStart = (mk.marked_range && mk.marked_range.start_time && mk.marked_range.start_time.value) || 0;
+          events.push(evt({
+            index: idx++, track: 'MARKER', source: '',
+            recIn: rec + (mrStart - startVal), recOut: null,
+            name: mk.name || undefined, color: mk.color || undefined, fps: rate,
+          }));
+        }
         events.push(
           evt({
             index: idx++,
@@ -188,7 +240,7 @@ export function parseXMEMLEvents(xml, opts = {}) {
   const media = seq && seq.media;
   if (media) {
     const vtracks = media.video && media.video.track ? (Array.isArray(media.video.track) ? media.video.track : [media.video.track]) : [];
-    for (const t of vtracks) if (t.clipitem) walk(t.clipitem, 'V');
+    vtracks.forEach((t, vi) => { if (t.clipitem) walk(t.clipitem, vi === 0 ? 'V' : `V${vi + 1}`); });
     const atracks = media.audio && media.audio.track ? (Array.isArray(media.audio.track) ? media.audio.track : [media.audio.track]) : [];
     for (const t of atracks) if (t.clipitem) walk(t.clipitem, 'A');
   }
@@ -309,7 +361,7 @@ export function timingGuards(oldEvents, newEvents) {
     const ne = matches[0];
     if (!ne) {
       // A dropped audio event where its video sibling survives → dropped J/L-cut audio.
-      if (oe.track === 'A' && newEvents.some((x) => x.track === 'V' && x.source === oe.source))
+      if (oe.track === 'A' && newEvents.some((x) => x.track !== 'A' && x.source === oe.source))
         flags.push({ kind: 'dropped_split_audio', source: oe.source, detail: 'audio event gone but video sibling present (J/L-cut lost)' });
       continue;
     }
@@ -387,5 +439,20 @@ export function markerRoundtrip(markers, opts = {}) {
     throw new Error(`marker_roundtrip: ${markers.length} in, ${decoded.length} out — round-trip dropped markers`);
   const provenanceOk = decoded.every((m) => typeof m.provenance === 'string' && m.provenance.length);
   if (markers.length && !provenanceOk) throw new Error('marker_roundtrip: a marker lost its provenance tag');
-  return { count: decoded.length, markers: decoded, provenanceOk, roundTrip: 'ok' };
+  // Binary round-trip through the REAL Sm2SequenceLockableBlob codec
+  // (byte-exact vs a live export): provenance rides in customData, so an
+  // authored .drt carries it. Colors outside the measured 16 refuse there —
+  // markerRoundtrip normalizes to 'Blue' above, so this cannot throw for
+  // valid input; if it ever does, that IS the failed round-trip.
+  let blobRoundTrip = 'skipped (no markers)';
+  if (normalized.length) {
+    const { encodeTimelineMarkersBlob, decodeTimelineMarkersBlob } = require('../vendor/drp-format/timeline-markers-blob.js');
+    const back = decodeTimelineMarkersBlob(encodeTimelineMarkersBlob(normalized.map((m) => ({
+      frame: m.frame, color: m.color, name: m.name, note: m.note, customData: m.provenance,
+    }))));
+    if (back.length !== normalized.length) throw new Error(`marker_roundtrip: blob codec ${normalized.length} in, ${back.length} out`);
+    if (!back.every((m) => m.customData && m.customData.length)) throw new Error('marker_roundtrip: provenance lost in the blob codec');
+    blobRoundTrip = 'ok';
+  }
+  return { count: decoded.length, markers: decoded, provenanceOk, roundTrip: 'ok', blobRoundTrip };
 }

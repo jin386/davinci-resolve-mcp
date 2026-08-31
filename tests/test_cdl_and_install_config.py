@@ -146,6 +146,13 @@ class InstallConfigTests(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertIn("connect_resolve", captured["script"])
+        self.assertIn("connect_resolve(None)", captured["script"])
+        self.assertLess(
+            captured["script"].index("connect_resolve(None)"),
+            captured["script"].index("import DaVinciResolveScript"),
+        )
+        self.assertIn("native_import_attempted = True", captured["script"])
+        self.assertIn("os._exit(0)", captured["script"])
         self.assertIn(repo_root, captured["script"])
         # RESOLVE_SCRIPT_HOST propagated into the probe env by build_server_env.
         self.assertEqual(captured["env"].get("RESOLVE_SCRIPT_HOST"), "127.0.0.1")
@@ -836,6 +843,62 @@ class PythonVersionGateTests(unittest.TestCase):
         with patch.object(install, "_version_for_python", return_value=(3, 9, 0)):
             with self.assertRaises(SystemExit):
                 install.require_supported_python("/usr/bin/python3.9")
+
+
+class AntigravityConfigPathTests(unittest.TestCase):
+    """Issue #159 — two contributors report two paths; resolve by what exists."""
+
+    def _resolve(self, existing):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            for rel in existing:
+                target = fake_home / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("{}\n")
+            with patch.object(install, "home", return_value=fake_home):
+                resolved = install.antigravity_config()
+            return resolved.relative_to(fake_home).as_posix()
+
+    def test_falls_back_to_gemini_config_when_neither_exists(self):
+        self.assertEqual(self._resolve([]), ".gemini/config/mcp_config.json")
+
+    def test_uses_the_antigravity_path_when_only_it_exists(self):
+        self.assertEqual(
+            self._resolve([".gemini/antigravity/mcp_config.json"]),
+            ".gemini/antigravity/mcp_config.json",
+        )
+
+    def test_uses_the_config_path_when_only_it_exists(self):
+        self.assertEqual(
+            self._resolve([".gemini/config/mcp_config.json"]),
+            ".gemini/config/mcp_config.json",
+        )
+
+    def test_config_path_wins_when_both_exist(self):
+        """The installer never wrote ~/.gemini/config/, so its presence is evidence."""
+        self.assertEqual(
+            self._resolve([
+                ".gemini/config/mcp_config.json",
+                ".gemini/antigravity/mcp_config.json",
+            ]),
+            ".gemini/config/mcp_config.json",
+        )
+
+    def test_a_bare_antigravity_directory_is_not_taken_as_a_config(self):
+        """~/.gemini/antigravity/ holds runtime state on every install (#159)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            (fake_home / ".gemini" / "antigravity" / "logs").mkdir(parents=True)
+            with patch.object(install, "home", return_value=fake_home):
+                resolved = install.antigravity_config()
+        self.assertEqual(
+            resolved.relative_to(fake_home).as_posix(),
+            ".gemini/config/mcp_config.json",
+        )
+
+    def test_client_entry_uses_the_resolver(self):
+        entry = next(c for c in install.MCP_CLIENTS if c["id"] == "antigravity")
+        self.assertIs(entry["get_path"], install.antigravity_config)
 
 
 if __name__ == "__main__":

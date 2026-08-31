@@ -404,6 +404,88 @@ API_TRUTH: List[Dict[str, Any]] = [
         "submit": "bug",
     },
     {
+        "symbol": "Fusion object dir() omits real methods (GetAttrs / SetAttrs)",
+        "object": "Fusion Tool / Composition",
+        "signature": "dir(tool) -> incomplete list",
+        "reality": "`dir()` on a live Fusion Tool returns 38 names — with "
+                   "'Composition' listed TWICE — and omits GetAttrs and "
+                   "SetAttrs, which are documented Fusion Tool methods that "
+                   "work perfectly when called. Measured on free 21.0.3.7 over "
+                   "the in-app bridge: invoking GetAttrs directly returned "
+                   "{TOOLS_Name: 'Blur1', TOOLS_RegID: 'Blur'} and SetAttrs "
+                   "renamed the tool. This matters because Resolve fabricates a "
+                   "callable for ANY attribute name, so `dir()` is the only "
+                   "evidence of absence that exists — which makes an omitted "
+                   "name unrecoverable by probing. Any capability detection "
+                   "built on dir()/hasattr will therefore report a real Fusion "
+                   "method as missing. Resolve's own API objects do not have "
+                   "this problem: Timeline (60), TimelineItem (88) and "
+                   "Composition (92) all enumerate correctly.",
+        "recommended": "Do not treat dir()/hasattr as authoritative for Fusion "
+                       "Tool objects. Keep a curated set of documented Fusion "
+                       "methods that the enumeration omits, and identify a "
+                       "Fusion object positively (ConnectInput / FindMainInput "
+                       "/ GetControlPageNames on a Tool, AddTool / FindTool / "
+                       "GetToolList on a Composition) rather than relaxing the "
+                       "check globally, which would silently re-open capability "
+                       "detection on Resolve API objects.",
+        "tags": ["fusion", "introspection", "bridge", "free-edition"],
+        "submit": "bug",
+        "mitigation": ["_FUSION_UNENUMERATED_METHODS", "_FUSION_OBJECT_MARKERS"],
+    },
+    {
+        "symbol": "Composition.Lock (suppresses render invalidation for value writes)",
+        "object": "Composition (Fusion, via TimelineItem comps)",
+        "signature": "Lock() / Unlock()",
+        "reality": "A numeric tool.SetInput() performed between Comp.Lock() "
+                   "and Comp.Unlock(), when that write is the only thing the "
+                   "call does, is stored in the graph and reads back correctly "
+                   "from GetInput() but is NOT applied when the timeline is "
+                   "rendered. Measured live on Studio 19.1.3.7 (2026-08-21) "
+                   "with MediaIn -> Blur(XBlurSize 20) -> MediaOut on a "
+                   "media-backed clip: written under the lock the delivered "
+                   "H.264 render is bit-identical to the no-comp baseline "
+                   "(ffmpeg PSNR inf); the identical write with the lock "
+                   "removed renders at PSNR 24.38 dB and the file shrinks "
+                   "2.0 MB -> 727 KB, as a blur should. The variable was "
+                   "isolated against the comp handle (AddFusionComp, "
+                   "GetFusionCompByIndex and GetFusionCompByName all render), "
+                   "the node name, and the write form (attribute assignment "
+                   "and SetInput both render unlocked). STRUCTURAL edits are "
+                   "unaffected: AddTool and ConnectInput inside a lock render "
+                   "normally, so the lock is not broadly unsafe — it "
+                   "suppresses the parameter-change invalidation that a value "
+                   "write depends on. Lock() is widely recommended for "
+                   "batching Fusion edits, which is how this reaches "
+                   "production code. MECHANISM (settled 2026-08-22). "
+                   "PRECONDITION: it only reproduces on a comp whose graph was "
+                   "BUILT through lock-wrapped AddTool/ConnectInput; the same "
+                   "locked write against a graph wired by plain attribute "
+                   "assignment renders normally. TRIGGER: the locked write is "
+                   "lost when it is the FIRST value write to that comp since "
+                   "the build. PRIMING: any unlocked value write anywhere in "
+                   "the comp clears the condition permanently — even writing a "
+                   "DEFAULT value to an unrelated tool — and so does "
+                   "StartUndo/EndUndo around the write. A structural "
+                   "ConnectInput inside the same lock does NOT clear it, and "
+                   "neither does a GetInput readback. Priming makes false "
+                   "negatives easy: a test that sets anything up with a plain "
+                   "SetInput before the call under test will pass even with the "
+                   "bug present.",
+        "recommended": "Never hold a comp lock across a value write. Lock only "
+                       "structural work (AddTool/ConnectInput) and set inputs "
+                       "outside it. Because every readback the API offers "
+                       "agrees with the value that was written, this failure "
+                       "is invisible without a render — prove Fusion "
+                       "parameter changes with a delivered frame or "
+                       "gallery_stills grab_and_export, never with GetInput.",
+        "tags": ["fusion", "silent-failure", "render", "readback"],
+        "submit": "bug",
+        "mitigation": ["_FUSION_VALUE_WRITE_NOTE",
+                       "tests/live_fusion_value_write_validation.py",
+                       "tests/test_fusion_value_write_lock.py"],
+    },
+    {
         "symbol": "TimelineItem.AddFusionComp / LoadFusionCompByName",
         "object": "TimelineItem (media-backed clip)",
         "reality": "A Fusion composition created on a media clip through the API "
@@ -434,7 +516,39 @@ API_TRUTH: List[Dict[str, Any]] = [
                    "either. Contrast InsertFusionTitleIntoTimeline, whose comp "
                    "DOES render — text set via SetInput('StyledText') appears in "
                    "the output — so this is specific to comps attached to "
-                   "media-backed clips, not to Fusion through the API generally.",
+                   "media-backed clips, not to Fusion through the API generally. "
+                   "REPRODUCED 2026-08-21 on Studio 19.1.3.7: a rooted "
+                   "MediaIn -> Blur -> MediaOut comp built entirely through "
+                   "the API renders (PSNR 24.38 dB vs the no-comp baseline), "
+                   "so the 2026-08-02 correction stands. Note that an "
+                   "important share of 'the comp was ignored' readings are "
+                   "NOT this entry at all but the Composition.Lock bug above "
+                   "— a parameter written under a comp lock reads back "
+                   "correctly and never reaches the render, which looks "
+                   "identical from the API side. That is what an independent "
+                   "2026-08-20 report on Studio 21.0.4.5 was measuring: a "
+                   "wired MediaIn -> Blur -> MediaOut comp, and a Transform "
+                   "variant, both delivered renders bit-identical to the "
+                   "no-comp baseline (PSNR inf) when built and set through "
+                   "this server. It was read at the time as a version "
+                   "regression (19.1.3.7 honours a wired comp, 21.0.4.5 does "
+                   "not); with the lock bug identified, the simpler reading is "
+                   "that the same defect reproduces on 21.0.4.5 — and since "
+                   "the lock bug has only been isolated on 19.1.3.7, that "
+                   "report is the only evidence it is not build-specific. "
+                   "SETTLED 2026-08-22 on DaVinci Resolve 21.0.3.7 (free "
+                   "edition, driven through the in-app bridge): the same wired "
+                   "MediaIn -> Blur(XBlurSize 20) -> MediaOut comp, with the "
+                   "value written through this server's fixed set_input, "
+                   "RENDERS - PSNR 24.38 dB vs the no-comp baseline and the "
+                   "file shrinking 2,017,973 -> 727,261 bytes, the same figure "
+                   "measured on 19.1.3.7 from the same source. So the "
+                   "'renders on 19.1.3.7, ignored on 21' split was the "
+                   "Composition.Lock bug on both sides, not a version "
+                   "regression, and 'a wired comp renders' now holds across "
+                   "both Resolve generations tested. The 21 confirmation is a "
+                   "free-edition 21.0.3.7 rather than the Studio 21.0.4.5 the "
+                   "original report used; no Studio 21 was available to test.",
         "recommended": "Wire the graph so MediaOut descends from MediaIn — that "
                        "is the difference between a comp that renders and one "
                        "that is silently bypassed, and it is what made this look "
@@ -448,8 +562,16 @@ API_TRUTH: List[Dict[str, Any]] = [
                        "chosen from the API (see the Track Selector entry), so "
                        "overlaying onto an existing clip's track is not currently "
                        "reachable end-to-end. Building the comp in the Fusion page "
-                       "UI works; only the API-created comp is ignored.",
-        "tags": ["fusion", "silent-failure", "render"],
+                       "UI works; only the API-created comp is ignored. "
+                       "Never claim a Fusion effect from comp readback alone — "
+                       "prove it with a rendered frame (gallery_stills "
+                       "grab_and_export before/after, or a delivered render). On "
+                       "setups where even the wired comp does not render (see the "
+                       "2026-08-20 measurement), treat per-item Fusion effects as "
+                       "HITL (a human builds or activates the comp in the UI) and "
+                       "bake stills motion with ffmpeg when unattended output is "
+                       "required.",
+        "tags": ["fusion", "silent-failure", "render", "readback", "hitl"],
         "submit": "bug",
     },
     {
@@ -1732,6 +1854,322 @@ API_TRUTH: List[Dict[str, Any]] = [
         "tags": ["timeline", "edit", "off-by-one", "readback"],
     },
     {
+        "symbol": "MediaPool.ImportTimelineFromFile (internal sequence name overrides timelineName)",
+        "object": "MediaPool",
+        "signature": "(filePath, {timelineName, importSourceClips, ...}) -> Timeline",
+        "reality": "For FCP7 XML, the sequence name INSIDE the file wins over "
+                   "the timelineName import option. When the internal name "
+                   "matches an existing timeline, the call returns that "
+                   "EXISTING timeline — no error, no new timeline — so an "
+                   "export→edit→re-import loop keying uniqueness on the option "
+                   "'succeeds' while operating on one timeline forever "
+                   "(issue #171, Studio 21.0.4.5; wrapper behavior verified on "
+                   "19.1.3.7). Distinct from the documented repeated-"
+                   "timelineName None return: here the option is fresh and the "
+                   "file's name is stale. THE NAMING AUTHORITY DIFFERS PER "
+                   "FORMAT (all measured on 19.1.3.7): FCP7 XML ignores "
+                   "timelineName entirely (internal <name> wins); AAF honours "
+                   "timelineName when given and falls back to its internal "
+                   "name; OTIO honours timelineName; and .drt names the "
+                   "timeline after the FILE (see the .drt entry below). Only "
+                   "FCP7 exhibits the returned-existing trap.",
+        "recommended": "Rewrite the <sequence><name> inside the file to the "
+                       "intended name before importing — "
+                       "timeline.import_timeline_checked does this "
+                       "automatically for FCP7 XML and errors when a "
+                       "non-rewritable format still returns an existing "
+                       "timeline. Never treat a truthy return as proof of "
+                       "creation; check the returned timeline's id against "
+                       "the pre-import set.",
+        "tags": ["timeline", "import", "silent-failure", "unreliable-return"],
+        "submit": "bug",
+        "issue": 171,
+    },
+    {
+        "symbol": "Imported media renders only with NATIVE pool descriptors (repointed entries read back fine, render never)",
+        "object": "MediaPool / render engine",
+        "reality": "An imported archive's media links by the pool entry's DEEP "
+                   "descriptors (compressed Clip identity blobs, Radiometry, "
+                   "keyed-dict FieldsBlobs, stream data), not by the visible "
+                   "MediaFilePath. A pool entry whose visible fields all name "
+                   "the right file but whose deep blobs describe another "
+                   "imports cleanly, reads back perfectly (items, names, "
+                   "source frames, linked counts), and then either renders "
+                   "BLACK or fails with 'Full resolution media not found' — "
+                   "and worse, when the stale identity matches a file that "
+                   "exists on the machine, Resolve links THAT file (observed: "
+                   "a template captured from a client clip silently linked "
+                   "the client clip). Measured by bisection on Studio "
+                   "19.1.3.7: pristine native archives render (YAVG 123), "
+                   "every synthesized/repointed variant read back identically "
+                   "and did not.",
+        "recommended": "Never synthesize pool media descriptors. Capture them "
+                       "natively once per file with "
+                       "media_pool.capture_media_template (builds a scratch "
+                       "project around the file, caches the native element), "
+                       "and author with drt.assemble, which transplants the "
+                       "cached element and rewires MediaRefs — rendered "
+                       "output then matches a natively built timeline "
+                       "exactly. Always render-verify authored timelines; "
+                       "structural readback cannot see this class.",
+        "tags": ["media-pool", "import", "render", "silent-failure", "readback"],
+    },
+    {
+        "symbol": "A timeline's start timecode lives in the pool clip's MediaExtents blob (patchable offline)",
+        "object": "Sm2MpTimelineClip.MediaExtents",
+        "reality": "The start timecode of a timeline is stored in exactly "
+                   "one non-cosmetic place in a .drp/.drt: the media pool "
+                   "timeline clip's MediaExtents blob, a 16-byte pair of "
+                   "LE doubles [startSeconds, durationSeconds] (measured: "
+                   "02:03:04:05 @24 appears only as 7384.2083 there and in "
+                   "a UI-state blob). Patching startSeconds offline and "
+                   "importing yields a timeline at the new start timecode "
+                   "with clips at their absolute frames, and it renders.",
+        "recommended": "To author a non-default start TC offline, patch "
+                       "MediaExtents (drt.assemble spec.startFrame does "
+                       "this) and keep clip Start frames >= the new origin "
+                       "- clips before it are silently dropped on import. "
+                       "For conform, assemble_from_interchange "
+                       "preserveStartTimecode=true anchors at the "
+                       "turnover's real first record frame instead of "
+                       "01:00:00:00.",
+        "tags": ["timecode", "drt", "import"],
+        "submit": "missing",
+    },
+    {
+        "symbol": "Timeline import MERGES pool media by a coarse identity - similar files can silently cross-link",
+        "object": "ImportTimelineFromFile / media pool",
+        "reality": "When a .drt import lands in a project that already "
+                   "holds a media entry whose pool identity blob matches "
+                   "the incoming one, Resolve MERGES them and every clip "
+                   "relinks to the EXISTING media - silently. The identity "
+                   "is coarse: two different files (5.6MB vs 93KB, "
+                   "different names, mtimes 1s apart) had identity blobs "
+                   "byte-identical except internal uuids, and the second "
+                   "file's clips all played the first file's picture "
+                   "(readback showed the wrong clip NAME; measured E33/E34 "
+                   "on 19.1.3.7). Importing the same archive into a FRESH "
+                   "project materialized both files correctly - the merge "
+                   "only bites across imports.",
+        "recommended": "After importing an authored timeline into a "
+                       "non-empty project, verify per-item file paths (or "
+                       "render probe frames) before trusting the conform - "
+                       "linked==total cannot see a cross-link. Files "
+                       "generated in the same second are the risk class; "
+                       "distinct mtimes distinguish them.",
+        "tags": ["import", "media-pool", "silent-failure", "drt"],
+        "submit": "bug",
+    },
+    {
+        "symbol": "Embedded source timecode lives in the clip's MediaStartTime (SECONDS); AAF duplicates audio per channel",
+        "object": "Sm2TiVideoClip.MediaStartTime / AAF export",
+        "reality": "Two conform-ingest measurements (2026-08-30, rich "
+                   "Resolve 19 AAF export + its sources). (1) A source with "
+                   "embedded timecode is referenced by the timeline clip's "
+                   "<MediaStartTime> in SECONDS (01:00:00:00 -> 3600); a "
+                   "transplant clone keeping the template donor's 0 imports "
+                   "and reads back fine but the render fails with 'Full "
+                   "resolution media not found at 01:00:00:00'. (2) The AAF "
+                   "export carries one event per audio CHANNEL: every "
+                   "A-track event of a dual-mono clip arrives twice with "
+                   "identical ranges.",
+        "recommended": "capture_media_template harvests mediaStartTime and "
+                       "the native clip elements; drt.assemble clones the "
+                       "source's own captured clip per cut (render-verified: "
+                       "the TC-bearing source plays picture and audio, and "
+                       "the full AAF route renders frame-accurately). "
+                       "Re-capture templates for TC-bearing media. The "
+                       "assemble bridge merges identical audio channel legs "
+                       "(report.audioChannelLegsMerged) instead of refusing "
+                       "them as a same-track overlap.",
+        "tags": ["timecode", "aaf", "audio", "drt", "silent-failure"],
+        "submit": "missing",
+    },
+    {
+        "symbol": "Audio tracks cannot be grown in an imported timeline; Fairlight strips live in the pool Sm2Sequence.FieldsBlob",
+        "object": "Sm2TiTrack (audio) / FLStudioModelBA",
+        "reality": "An audio track added to a SeqContainer by cloning "
+                   "imports fine, reads back fine (track count, items, "
+                   "everything), and renders SILENT. The per-timeline "
+                   "Fairlight model (FLStudioModelBA, ~7KB compressed to "
+                   "~420KB, inside the media pool's Sm2Sequence.FieldsBlob) "
+                   "holds one strip per audio track, and a track without a "
+                   "strip is mute. Measured by elimination on 19.1.3.7: "
+                   "clip byte-identical to a live-authored one, track "
+                   "byte-identical (SubType is the CHANNEL FORMAT code - "
+                   "1=mono - not an ordinal), pool entry shared with a "
+                   "playing A1 clip - still silent; only a timeline whose "
+                   "template was CAPTURED with the tracks plays.",
+        "recommended": "Never clone audio tracks offline. Capture the "
+                       "template with the audio tracks already present "
+                       "(the r19 media template carries 8 mono tracks with "
+                       "valid strips; drt.assemble audioOnly cuts land on "
+                       "them and render at native level). Refuse placements "
+                       "beyond the captured ceiling. Audio aliveness is "
+                       "readback-blind: verify by rendered RMS, not "
+                       "structure.",
+        "tags": ["fairlight", "audio", "import", "silent-failure", "drt"],
+        "submit": "bug",
+    },
+    {
+        "symbol": "MediaTimemapBA keyframes are generation-split; 19.x silently ignores the R21 protobuf form",
+        "object": "Sm2TimeMap (per-clip retime blob)",
+        "reality": "Resolve 21 encodes a retimed clip's KeyframesBA as "
+                   "protobuf points; Resolve 19.1.3 encodes it as a "
+                   "keyed-dict of keyed-dict keyframes ({interp, YOut, YIn, "
+                   "Y, XOut, XIn, X}). On import, 19 SILENTLY IGNORES the "
+                   "protobuf form — the clip reads back and plays at 100% "
+                   "with no warning (measured: identical timelines, one per "
+                   "form; protobuf → source 0..96 over 96 frames, keyed → "
+                   "source 0..48 over 96 frames and a live 50% render). "
+                   "The map spans the WHOLE source stretched by 1/speed; "
+                   "the clip's <In>/<Duration> window into it in RECORD "
+                   "frames (srcIn converts by /speed). REVERSE is the same "
+                   "envelope with the Y endpoints swapped - kf0=(0,YMax), "
+                   "kf1=(XMax,0) - and In then measures from the source "
+                   "END: (frames - srcIn - dur*speed)/speed (measured: a "
+                   "reversed srcIn-24 dur-48 cut reads back source 71->23). "
+                   "A FLAT map (both keyframes at the same Y - a freeze) is "
+                   "the one shape where readback and render DIVERGE: the "
+                   "item reads back frozen (source 96..96) but renders "
+                   "MOVING (48/48 unique frames measured). Do not author "
+                   "freezes as flat timemaps. AUDIO clips ignore the "
+                   "timemap entirely: a 50% keyed map on an imported audio "
+                   "clip reads back retimed (source 0..48 over 96 record "
+                   "frames) but RENDERS at 100% - unchanged pitch and "
+                   "spectrum (highpass/lowpass split identical to the 1x "
+                   "reference).",
+        "recommended": "Author retimes for pre-21 hosts with the keyed "
+                       "form (drt.assemble cuts[].speed does this; encoder "
+                       "byte-exact against a live 19.1.3.7 harvest). Treat "
+                       "any cross-generation timemap as unverified until a "
+                       "readback shows the retimed source range.",
+        "tags": ["retime", "import", "silent-failure", "drt"],
+        "submit": "bug",
+    },
+    {
+        "symbol": "Imported Fusion comps render via byte-keyed disk cache on 19.x (offline comp edits render black)",
+        "object": "Fusion / render engine",
+        "reality": "On Studio 19.1.3.7, a Fusion composition arriving via "
+                   "timeline import renders only when the machine's Fusion "
+                   "disk cache (CacheClip/) holds frames keyed to the comp "
+                   "blob's EXACT bytes. Measured by discrimination: the "
+                   "untouched harvested title rendered its text; the same "
+                   "blob after an IDENTITY recompression — byte-identical "
+                   "Lua, different zlib bytes, verified consistent framing — "
+                   "imported, read back perfectly, and rendered black; a "
+                   "text-patched blob (also byte-verified) rendered black "
+                   "the same way. The live-render fallback for imported "
+                   "comps does not produce frames on 19; 21-generation "
+                   "hosts render imported comps live (the template-splice "
+                   "title/generator primitives were proven there).",
+        "recommended": "Never edit an imported comp's bytes offline for a "
+                       "19.x host — no valid re-encoding can hit the cache. "
+                       "Author media offline (renders everywhere via the "
+                       "native-descriptor transplant) and set title text "
+                       "POST-IMPORT with timeline.set_title_text, whose "
+                       "Fusion-comp write path is live-verified on 19.1.3. "
+                       "Built-in GENERATORS are exempt: Sm2TiGenerator "
+                       "clips carry no Fusion comp, and offline-authored "
+                       "Solid Color / SMPTE Color Bar / Grey Scale all "
+                       "render live from an imported .drt (measured YAVG "
+                       "16 / 104.9 / 125.1 over a 234 white base). "
+                       "Render-verify any imported Fusion TITLE before "
+                       "delivery; structural readback cannot see this.",
+        "tags": ["fusion", "render", "import", "silent-failure"],
+        "submit": "bug",
+    },
+    {
+        "symbol": "MediaPool.ImportTimelineFromFile (.drt requirements and filename naming)",
+        "object": "MediaPool",
+        "signature": "(drtPath, {importSourceClips, ...}) -> Timeline",
+        "reality": "Fully mapped by bisection on Studio 19.1.3.7: a .drt IS "
+                   "a .drp that ImportTimelineFromFile accepts — a whole "
+                   "saved-project export renamed .drt imports, clips intact. "
+                   "Requirements: (1) project.xml present; (2) MediaPool/"
+                   "MpFolder.xml present — it holds the Sm2Sequence/"
+                   "Sm2Timeline objects; (3) the SeqContainer keeps its "
+                   "ORIGINAL uuid path — renaming it 'succeeds' with an "
+                   "EMPTY timeline (items=0, no error), the nastiest variant; "
+                   "(4) version stamps at or below the host's ProjectVersion; "
+                   "(5) native blob schema — flat template containers are "
+                   "refused; (6) the source must be a SAVED export "
+                   "(ExportProject snapshots the saved DB state, so an "
+                   "unsaved timeline exports EMPTY tracks). Every "
+                   "Sm2MpTimelineClip block in MpFolder imports as a "
+                   "timeline: extra blocks arrive as ghost empty timelines "
+                   "unless removed (match blocks via the kept container's "
+                   "track <Sequence> DbIds). The imported timeline is named "
+                   "after the FILE, and a refused import can raise a modal "
+                   "dialog that BLOCKS the scripting call until a human "
+                   "dismisses it.",
+        "recommended": "Follow the recipe: drt.extract_from_drp implements "
+                       "it (original container path, MpFolder carried, ghost "
+                       "blocks removed, Gallery dropped), and drt.assemble "
+                       "authors importable native-schema archives from "
+                       "scratch (template-spliced; pass targetAppVersion on "
+                       "pre-21 hosts). Save the project before ExportProject. "
+                       "Name the timeline by naming the FILE. Never batch "
+                       "speculative .drt imports unattended — one refusal "
+                       "can hold the session hostage behind its dialog; "
+                       "timeline.import_timeline_checked refuses the flat "
+                       "authored shape up front for exactly that reason.",
+        "tags": ["timeline", "import", "silent-failure", "headless"],
+        "submit": "bug",
+    },
+    {
+        "symbol": "MediaPool.AppendToTimeline clipInfo recordFrame (timeline-absolute origin)",
+        "object": "MediaPool",
+        "signature": "([{mediaPoolItem, startFrame, endFrame, recordFrame, "
+                     "trackIndex, mediaType}]) -> [TimelineItem]",
+        "reality": "clipInfo recordFrame is TIMELINE-ABSOLUTE: it counts from "
+                   "Resolve's global frame zero, not from the timeline's own "
+                   "GetStartFrame(). A timeline with the default 01:00:00:00 "
+                   "start begins at frame 86400, so recordFrame=0 places the "
+                   "item about an hour BEFORE the timeline starts. Nothing "
+                   "reports the mistake, because the items are real and "
+                   "self-consistent: AppendToTimeline returns them, "
+                   "GetName/GetSourceStartFrame/GetSourceEndFrame all read back "
+                   "the expected values, and the bin count is right. Only a "
+                   "render exposes it — the engine walks the timeline's own "
+                   "start->end range, so the job reports JobStatus Complete at "
+                   "100% in under 2s and writes a ~6KB stub for a 405s "
+                   "timeline. The trap is that the two frame conventions sit "
+                   "side by side: marker frameIds ARE timeline-relative "
+                   "(frame 0 == first frame), while recordFrame and "
+                   "TimelineItem.GetStart/GetEnd are absolute. Distinct from "
+                   "the null-id entry below, which is a recordFrame landing in "
+                   "an OCCUPIED span rather than before the start. Worse, the "
+                   "render JOB's own metadata lies too: Resolve rewrites the "
+                   "job's MarkIn/MarkOut down to the collapsed extent (measured "
+                   "live on 19.1.3.7: 96 frames of content before start -> an "
+                   "explicit 96-frame mark range became a 1-frame job, Complete "
+                   "at 100%, a 1-frame black stub), so output-duration vs "
+                   "job-mark-range checks read clean. The only truthful "
+                   "readback is the timeline items themselves, which report "
+                   "their real GetStart/GetEnd — before the start frame. "
+                   "Verified on "
+                   "Studio 20.3.2.9 (v2.17.1 probe: relative record_frame 12 "
+                   "landed at 86400 + 12 = 86412, absolute preserved 86484), "
+                   "independently on Studio 21.0.4.5 (issue #164), and the "
+                   "mark-range rewrite on Studio 19.1.3.7 (2026-08-29).",
+        "recommended": "Offset every recordFrame by timeline.GetStartFrame(). "
+                       "This server already does it: "
+                       "media_pool.append_to_timeline defaults to "
+                       "record_frame_mode='relative' and adds the start frame, "
+                       "so pass record_frame_mode='absolute' only for raw "
+                       "Resolve frame numbers — and since v2.103.5 an absolute "
+                       "value below the timeline start is refused outright. "
+                       "When driving the API directly, "
+                       "never treat JobStatus Complete as proof a render "
+                       "worked — and do not trust the job's MarkIn/MarkOut as "
+                       "the expected duration either. render.verify_output "
+                       "(v2.104.1) cross-checks the job against its timeline's "
+                       "item extents and flags items before the start frame.",
+        "tags": ["timeline", "edit", "render", "silent-failure", "media-pool"],
+        "issue": 164,
+    },
+    {
         "symbol": "Timeline.DeleteClips (requires the Edit page; flaky first attempt)",
         "object": "Timeline",
         "signature": "([TimelineItem], ripple) -> bool",
@@ -2082,6 +2520,153 @@ API_TRUTH: List[Dict[str, Any]] = [
                        "rather than trusting the return.",
         "tags": ["gallery", "stills", "headless", "unreliable-return"],
         "submit": "bug",
+    },
+    {
+        "symbol": "MediaPool.AppendToTimeline (null-id timeline items)",
+        "object": "MediaPool",
+        "signature": "([{clipInfo}, ...]) -> [TimelineItem]",
+        "reality": "The returned TimelineItem objects can have an unreadable/empty "
+                   "GetUniqueId, notably when the clipInfo recordFrame lands in a "
+                   "span still occupied by another item (any duplicate-then-delete "
+                   "'move' whose offset is smaller than the item duration hits "
+                   "this). The item may not actually exist on the timeline. A "
+                   "session that trusted the non-empty return and deleted the "
+                   "sources lost 26 clips (Portugal timeline, 2026-08-19).",
+        "recommended": "Never treat AppendToTimeline's return as proof of "
+                       "placement. Re-enumerate the track and match on record "
+                       "frame + duration before any dependent delete; never "
+                       "shift items by duplicate-then-delete into occupied "
+                       "spans — use timeline.ripple_insert, which rebuilds the "
+                       "tail into free space and verifies by readback.",
+        "tags": ["editorial", "silent-failure", "unreliable-return", "timeline"],
+        "submit": "bug",
+        "mitigation": ["_append_and_recover_timeline_item duplicate_verified gate",
+                       "_timeline_ripple_insert_impl"],
+    },
+    {
+        "symbol": "TimelineItem.SetCDL (write-only — no GetCDL anywhere)",
+        "object": "TimelineItem",
+        "signature": "({NodeIndex, Slope, Offset, Power, Saturation}) -> Bool",
+        "reality": "SetCDL writes a node's CDL but no object exposes a read: "
+                   "no GetCDL on TimelineItem or Graph in the API reference, "
+                   "and dir() on a live Graph confirms (Studio 19.1.3.7). A "
+                   "grade applied via SetCDL cannot be read back, diffed, or "
+                   "verified through the API.",
+        "recommended": "Track intended CDL values in the caller, or read the "
+                       "actual grade by exporting a DRX still and decoding it "
+                       "(this repo's drx tool decodes 100% of DRX params — "
+                       "slope/offset/power/sat included).",
+        "tags": ["color", "missing-method", "readback"],
+        "submit": "missing",
+    },
+    {
+        "symbol": "Graph.SetNodeEnabled (write-only — no GetNodeEnabled)",
+        "object": "Graph",
+        "signature": "(nodeIndex, bool) -> Bool",
+        "reality": "A node's bypass state can be set but never read: no "
+                   "GetNodeEnabled in the API reference, and dir() on a live "
+                   "Graph confirms (Studio 19.1.3.7). After a SetNodeEnabled "
+                   "the caller cannot verify it took, and the pre-existing "
+                   "state of a node someone toggled in the UI is unknowable.",
+        "recommended": "Treat node-enable state as write-only: record what "
+                       "you set, and verify visually (rendered-frame compare) "
+                       "when the state matters.",
+        "tags": ["color", "missing-method", "readback"],
+        "submit": "missing",
+    },
+    {
+        "symbol": "TimelineItem.SetKeyframeInterpolation (write-only)",
+        "object": "TimelineItem",
+        "signature": "(property, frame, type) -> Bool",
+        "reality": "Interpolation can be written per keyframe but nothing "
+                   "returns it: GetKeyframeAtIndex/GetPropertyAtKeyframeIndex "
+                   "expose frame and value only (API reference). On Studio "
+                   "19.1.3.7 the whole keyframe method family is absent from "
+                   "dir() — these methods are 20.x+.",
+        "recommended": "Record interpolation choices in the caller; readback "
+                       "is not available at any version.",
+        "tags": ["timeline", "missing-method", "readback", "keyframes"],
+        "submit": "missing",
+    },
+    {
+        "symbol": "Resolve.SetHighPriority (write-only, irreversible per session)",
+        "object": "Resolve",
+        "signature": "() -> Bool",
+        "reality": "Raises the Resolve process priority; there is no getter "
+                   "and no way to lower it again through the API (confirmed "
+                   "absent from dir() on Studio 19.1.3.7).",
+        "recommended": "Call it only when the user asked for a long render on "
+                       "a dedicated machine; state cannot be read back or "
+                       "undone without restarting Resolve.",
+        "tags": ["app-control", "missing-method", "readback"],
+        "submit": "missing",
+    },
+    {
+        "symbol": "Project.IsRenderingInProgress (stuck True after deleting the rendering project)",
+        "object": "Project",
+        "signature": "() -> Bool",
+        "reality": "Deleting or closing a project while its render job is "
+                   "still running orphans the render and wedges the whole "
+                   "render pipeline: the output file stops growing and "
+                   "Resolve idles at 0% CPU, IsRenderingInProgress on the "
+                   "NEXT current project reports True indefinitely, "
+                   "StopRendering does not clear it, NEW render jobs sit at "
+                   "0% forever (then StartRendering starts returning False), "
+                   "and Resolve.Quit() is refused because the app believes a "
+                   "render is running — even project creation can start "
+                   "returning None behind the quit-confirm dialog "
+                   "(reproduced live on Studio 19.1.3.7, 2026-08-29).",
+        "recommended": "Never close or delete a project while "
+                       "IsRenderingInProgress is True — StopRendering first, "
+                       "wait for False, then close. Once wedged, only a "
+                       "manual quit (confirming the dialog) or force-quit "
+                       "clears it; treat a True that persists at 0% CPU with "
+                       "a static output file as stuck rather than rendering. "
+                       "Poll GetRenderJobStatus for completion instead of "
+                       "IsRenderingInProgress, which this failure poisons.",
+        "tags": ["render", "silent-failure", "unreliable-return"],
+        "submit": "bug",
+    },
+    {
+        "symbol": "TimelineItem.CreateMagicMask (needs operator clicks)",
+        "object": "TimelineItem",
+        "signature": "(mode) -> bool",
+        "reality": "Returns False when the item carries no Magic Mask clicks. "
+                   "Magic Mask v2 is click-driven (manual ch. 139; strokes are "
+                   "the legacy v1 interface) and the scripting API has no way to "
+                   "place a click, so on a fresh item the call can never isolate "
+                   "anything — it only tracks a mask the operator already seeded. "
+                   "Mode strings are 'F', 'B', 'BI'; long spellings like "
+                   "'Forward' are rejected.",
+        "recommended": "Treat CreateMagicMask as track-only: have the operator "
+                       "click the subject (Color page > Magic Mask palette) and "
+                       "then call it, or surface the HITL steps instead of a "
+                       "bare False. Verify isolation with a rendered frame "
+                       "(gallery_stills grab_and_export), never a thumbnail.",
+        "tags": ["ai", "magic-mask", "hitl", "silent-failure"],
+        "submit": "missing",
+        "mitigation": ["_magic_mask_hitl_result"],
+    },
+    {
+        "symbol": "TimelineItem.SetCDL (write-only, no GetCDL)",
+        "object": "TimelineItem",
+        "signature": "({NodeIndex, Slope, Offset, Power, Saturation}) -> bool",
+        "reality": "There is no GetCDL, so applied CDL values cannot be read "
+                   "back; the bool is the only signal and it returns False "
+                   "with no reason (missing node, still/generator item, values "
+                   "silently rejected). NodeIndex is 1-based (README line 6) "
+                   "and must not exceed Graph.GetNumNodes() — note "
+                   "TimelineItem.GetNumNodes is deprecated; the count lives on "
+                   "item.GetNodeGraph().",
+        "recommended": "Read item.GetNodeGraph().GetNumNodes() before SetCDL "
+                       "and diagnose a False against the node count and clip "
+                       "type. Prove the applied look with a rendered frame "
+                       "(gallery_stills grab_and_export or "
+                       "Project.ExportCurrentFrameAsStill), not the return "
+                       "value.",
+        "tags": ["color", "cdl", "readback", "silent-failure"],
+        "submit": "missing",
+        "mitigation": ["_cdl_node_preflight", "_cdl_failure_diagnosis"],
     },
 ]
 

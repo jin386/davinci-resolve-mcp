@@ -12,7 +12,7 @@ that none exists).
 
 **Verified on:** DaVinci Resolve Studio 21.0.2
 
-**Totals:** 27 missing capabilities, 35 bugs / unreliable behaviors.
+**Totals:** 35 missing capabilities, 45 bugs / unreliable behaviors.
 
 The authoritative source is the runtime-queryable `api_truth` ledger
 (`resolve_control api_truth "<query>"`); this document is generated from
@@ -214,6 +214,20 @@ equivalent, blocking full automation.
 - **Workaround / current handling:** Treat as irreversible within a session. server returns _ok() unconditionally because there is nothing to check.
 - **Tags:** resolve-21, unreliable-return, irreversible, session-wide
 
+### A timeline's start timecode lives in the pool clip's MediaExtents blob (patchable offline)
+
+- **Object:** `Sm2MpTimelineClip.MediaExtents`
+- **Behavior:** The start timecode of a timeline is stored in exactly one non-cosmetic place in a .drp/.drt: the media pool timeline clip's MediaExtents blob, a 16-byte pair of LE doubles [startSeconds, durationSeconds] (measured: 02:03:04:05 @24 appears only as 7384.2083 there and in a UI-state blob). Patching startSeconds offline and importing yields a timeline at the new start timecode with clips at their absolute frames, and it renders.
+- **Workaround / current handling:** To author a non-default start TC offline, patch MediaExtents (drt.assemble spec.startFrame does this) and keep clip Start frames >= the new origin - clips before it are silently dropped on import. For conform, assemble_from_interchange preserveStartTimecode=true anchors at the turnover's real first record frame instead of 01:00:00:00.
+- **Tags:** timecode, drt, import
+
+### Embedded source timecode lives in the clip's MediaStartTime (SECONDS); AAF duplicates audio per channel
+
+- **Object:** `Sm2TiVideoClip.MediaStartTime / AAF export`
+- **Behavior:** Two conform-ingest measurements (2026-08-30, rich Resolve 19 AAF export + its sources). (1) A source with embedded timecode is referenced by the timeline clip's <MediaStartTime> in SECONDS (01:00:00:00 -> 3600); a transplant clone keeping the template donor's 0 imports and reads back fine but the render fails with 'Full resolution media not found at 01:00:00:00'. (2) The AAF export carries one event per audio CHANNEL: every A-track event of a dual-mono clip arrives twice with identical ranges.
+- **Workaround / current handling:** capture_media_template harvests mediaStartTime and the native clip elements; drt.assemble clones the source's own captured clip per cut (render-verified: the TC-bearing source plays picture and audio, and the full AAF route renders frame-accurately). Re-capture templates for TC-bearing media. The assemble bridge merges identical audio channel legs (report.audioChannelLegsMerged) instead of refusing them as a same-track overlap.
+- **Tags:** timecode, aaf, audio, drt, silent-failure
+
 ### MediaPool.ImportMedia (current-folder destination only)
 
 - **Object:** `MediaPool`
@@ -238,6 +252,54 @@ equivalent, blocking full automation.
 - **Behavior:** Some render formats expose NO codecs at all, and the call then rejects every codec value — the empty string, the format id itself, and any plausible name ('Linear PCM'). Which formats are affected varies by build: 'wav' and 'gif' on Studio 19.1.3.7; 'braw', 'mts' and 'wav' on 21.0.4.5 (gif gained codecs, BRAW and MTS lost them). 'wav' is affected on both, so there is no documented way to select it through this API and an audio-only WAV deliverable is not expressible in scripting.
 - **Workaround / current handling:** Check GetRenderCodecs(format) first; when it is empty, treat the format as unreachable through this API rather than guessing a codec value. Render audio-only via ExportVideo=False on a format that does expose codecs, or drive it from a saved render preset.
 - **Tags:** render, deliver, audio, unsupported
+
+### TimelineItem.SetCDL (write-only — no GetCDL anywhere)
+
+- **Object:** `TimelineItem`
+- **Signature:** `({NodeIndex, Slope, Offset, Power, Saturation}) -> Bool`
+- **Behavior:** SetCDL writes a node's CDL but no object exposes a read: no GetCDL on TimelineItem or Graph in the API reference, and dir() on a live Graph confirms (Studio 19.1.3.7). A grade applied via SetCDL cannot be read back, diffed, or verified through the API.
+- **Workaround / current handling:** Track intended CDL values in the caller, or read the actual grade by exporting a DRX still and decoding it (this repo's drx tool decodes 100% of DRX params — slope/offset/power/sat included).
+- **Tags:** color, missing-method, readback
+
+### Graph.SetNodeEnabled (write-only — no GetNodeEnabled)
+
+- **Object:** `Graph`
+- **Signature:** `(nodeIndex, bool) -> Bool`
+- **Behavior:** A node's bypass state can be set but never read: no GetNodeEnabled in the API reference, and dir() on a live Graph confirms (Studio 19.1.3.7). After a SetNodeEnabled the caller cannot verify it took, and the pre-existing state of a node someone toggled in the UI is unknowable.
+- **Workaround / current handling:** Treat node-enable state as write-only: record what you set, and verify visually (rendered-frame compare) when the state matters.
+- **Tags:** color, missing-method, readback
+
+### TimelineItem.SetKeyframeInterpolation (write-only)
+
+- **Object:** `TimelineItem`
+- **Signature:** `(property, frame, type) -> Bool`
+- **Behavior:** Interpolation can be written per keyframe but nothing returns it: GetKeyframeAtIndex/GetPropertyAtKeyframeIndex expose frame and value only (API reference). On Studio 19.1.3.7 the whole keyframe method family is absent from dir() — these methods are 20.x+.
+- **Workaround / current handling:** Record interpolation choices in the caller; readback is not available at any version.
+- **Tags:** timeline, missing-method, readback, keyframes
+
+### Resolve.SetHighPriority (write-only, irreversible per session)
+
+- **Object:** `Resolve`
+- **Signature:** `() -> Bool`
+- **Behavior:** Raises the Resolve process priority; there is no getter and no way to lower it again through the API (confirmed absent from dir() on Studio 19.1.3.7).
+- **Workaround / current handling:** Call it only when the user asked for a long render on a dedicated machine; state cannot be read back or undone without restarting Resolve.
+- **Tags:** app-control, missing-method, readback
+
+### TimelineItem.CreateMagicMask (needs operator clicks)
+
+- **Object:** `TimelineItem`
+- **Signature:** `(mode) -> bool`
+- **Behavior:** Returns False when the item carries no Magic Mask clicks. Magic Mask v2 is click-driven (manual ch. 139; strokes are the legacy v1 interface) and the scripting API has no way to place a click, so on a fresh item the call can never isolate anything — it only tracks a mask the operator already seeded. Mode strings are 'F', 'B', 'BI'; long spellings like 'Forward' are rejected.
+- **Workaround / current handling:** Treat CreateMagicMask as track-only: have the operator click the subject (Color page > Magic Mask palette) and then call it, or surface the HITL steps instead of a bare False. Verify isolation with a rendered frame (gallery_stills grab_and_export), never a thumbnail.
+- **Tags:** ai, magic-mask, hitl, silent-failure
+
+### TimelineItem.SetCDL (write-only, no GetCDL)
+
+- **Object:** `TimelineItem`
+- **Signature:** `({NodeIndex, Slope, Offset, Power, Saturation}) -> bool`
+- **Behavior:** There is no GetCDL, so applied CDL values cannot be read back; the bool is the only signal and it returns False with no reason (missing node, still/generator item, values silently rejected). NodeIndex is 1-based (README line 6) and must not exceed Graph.GetNumNodes() — note TimelineItem.GetNumNodes is deprecated; the count lives on item.GetNodeGraph().
+- **Workaround / current handling:** Read item.GetNodeGraph().GetNumNodes() before SetCDL and diagnose a False against the node count and clip type. Prove the applied look with a rendered frame (gallery_stills grab_and_export or Project.ExportCurrentFrameAsStill), not the return value.
+- **Tags:** color, cdl, readback, silent-failure
 
 ## Bugs / Unreliable Behavior (please fix)
 
@@ -339,12 +401,28 @@ values, or automation-hostile modal prompts.
 - **Workaround / current handling:** Author OTIO for Resolve by mirroring what Resolve itself exports, and give every event its media timecode origin. editorial.convert_to_interchange (target 'otio') does this and reports any event whose origin had to be assumed in `mediaOriginAssumed` — a non-empty list means the file will only import if that media really starts at 00:00:00:00. To debug a refusal, export any timeline with EXPORT_OTIO and diff your document against it; do NOT chase missing media or reach for sanitize_media, which cannot even parse a .otio (it is JSON, not XML).
 - **Tags:** timeline, import, interchange, otio, silent-failure, conform
 
+### Fusion object dir() omits real methods (GetAttrs / SetAttrs)
+
+- **Object:** `Fusion Tool / Composition`
+- **Signature:** `dir(tool) -> incomplete list`
+- **Behavior:** `dir()` on a live Fusion Tool returns 38 names — with 'Composition' listed TWICE — and omits GetAttrs and SetAttrs, which are documented Fusion Tool methods that work perfectly when called. Measured on free 21.0.3.7 over the in-app bridge: invoking GetAttrs directly returned {TOOLS_Name: 'Blur1', TOOLS_RegID: 'Blur'} and SetAttrs renamed the tool. This matters because Resolve fabricates a callable for ANY attribute name, so `dir()` is the only evidence of absence that exists — which makes an omitted name unrecoverable by probing. Any capability detection built on dir()/hasattr will therefore report a real Fusion method as missing. Resolve's own API objects do not have this problem: Timeline (60), TimelineItem (88) and Composition (92) all enumerate correctly.
+- **Workaround / current handling:** Do not treat dir()/hasattr as authoritative for Fusion Tool objects. Keep a curated set of documented Fusion methods that the enumeration omits, and identify a Fusion object positively (ConnectInput / FindMainInput / GetControlPageNames on a Tool, AddTool / FindTool / GetToolList on a Composition) rather than relaxing the check globally, which would silently re-open capability detection on Resolve API objects.
+- **Tags:** fusion, introspection, bridge, free-edition
+
+### Composition.Lock (suppresses render invalidation for value writes)
+
+- **Object:** `Composition (Fusion, via TimelineItem comps)`
+- **Signature:** `Lock() / Unlock()`
+- **Behavior:** A numeric tool.SetInput() performed between Comp.Lock() and Comp.Unlock(), when that write is the only thing the call does, is stored in the graph and reads back correctly from GetInput() but is NOT applied when the timeline is rendered. Measured live on Studio 19.1.3.7 (2026-08-21) with MediaIn -> Blur(XBlurSize 20) -> MediaOut on a media-backed clip: written under the lock the delivered H.264 render is bit-identical to the no-comp baseline (ffmpeg PSNR inf); the identical write with the lock removed renders at PSNR 24.38 dB and the file shrinks 2.0 MB -> 727 KB, as a blur should. The variable was isolated against the comp handle (AddFusionComp, GetFusionCompByIndex and GetFusionCompByName all render), the node name, and the write form (attribute assignment and SetInput both render unlocked). STRUCTURAL edits are unaffected: AddTool and ConnectInput inside a lock render normally, so the lock is not broadly unsafe — it suppresses the parameter-change invalidation that a value write depends on. Lock() is widely recommended for batching Fusion edits, which is how this reaches production code. MECHANISM (settled 2026-08-22). PRECONDITION: it only reproduces on a comp whose graph was BUILT through lock-wrapped AddTool/ConnectInput; the same locked write against a graph wired by plain attribute assignment renders normally. TRIGGER: the locked write is lost when it is the FIRST value write to that comp since the build. PRIMING: any unlocked value write anywhere in the comp clears the condition permanently — even writing a DEFAULT value to an unrelated tool — and so does StartUndo/EndUndo around the write. A structural ConnectInput inside the same lock does NOT clear it, and neither does a GetInput readback. Priming makes false negatives easy: a test that sets anything up with a plain SetInput before the call under test will pass even with the bug present.
+- **Workaround / current handling:** Never hold a comp lock across a value write. Lock only structural work (AddTool/ConnectInput) and set inputs outside it. Because every readback the API offers agrees with the value that was written, this failure is invisible without a render — prove Fusion parameter changes with a delivered frame or gallery_stills grab_and_export, never with GetInput.
+- **Tags:** fusion, silent-failure, render, readback
+
 ### TimelineItem.AddFusionComp / LoadFusionCompByName
 
 - **Object:** `TimelineItem (media-backed clip)`
-- **Behavior:** A Fusion composition created on a media clip through the API is not applied at render WHEN MEDIAOUT HAS NO PATH FROM MEDIAIN. The original blanket form of this entry — 'never applied at render' — was too broad and was corrected on 2026-08-02: a comp wired MediaIn -> Blur -> MediaOut, created entirely through the API on an ordinary media clip, DOES render. PSNR between the plain and Fusion renders of the same timeline was 22.7 dB (identical would be infinite), the file shrank 22.5 MB -> 14.8 MB as a blur should, and the output was frame-for-frame identical in GUI and headless. A first attempt that wired ONLY MediaOut -> Blur, leaving the Blur with no source, made the render job come back 'Failed' with an 887-byte file — so an unrooted graph does not merely get bypassed, it can take the render down. What still stands is the original observation for the configuration it actually tested, which is retained below and has NOT been re-measured: AddFusionComp() returns the comp, AddTool/Connect/SetInput all succeed, and the whole graph reads back correctly (GetCompCount 1, MediaOut1.Input wired to the new tool, StyledText returning the value just set) — but the rendered output is byte-for-byte the untouched source media. Verified live on Studio 19.1.3.7 with the strongest form of the test: MediaOut1 fed ONLY by a Text+, with no path from MediaIn at all, still rendered the unmodified clip. LoadFusionCompByName on the sole comp does not activate it either. Contrast InsertFusionTitleIntoTimeline, whose comp DOES render — text set via SetInput('StyledText') appears in the output — so this is specific to comps attached to media-backed clips, not to Fusion through the API generally.
-- **Workaround / current handling:** Wire the graph so MediaOut descends from MediaIn — that is the difference between a comp that renders and one that is silently bypassed, and it is what made this look like 'Fusion never renders from the API'. Never leave a tool unrooted: a MediaOut fed by a tool with no source failed the render job outright. For text or effects over picture, insert a Fusion title/generator as its own timeline clip and set its Text+ (fusion_comp set_text_plus), rather than attaching a comp to the media clip. Note the destination track cannot be chosen from the API (see the Track Selector entry), so overlaying onto an existing clip's track is not currently reachable end-to-end. Building the comp in the Fusion page UI works; only the API-created comp is ignored.
-- **Tags:** fusion, silent-failure, render
+- **Behavior:** A Fusion composition created on a media clip through the API is not applied at render WHEN MEDIAOUT HAS NO PATH FROM MEDIAIN. The original blanket form of this entry — 'never applied at render' — was too broad and was corrected on 2026-08-02: a comp wired MediaIn -> Blur -> MediaOut, created entirely through the API on an ordinary media clip, DOES render. PSNR between the plain and Fusion renders of the same timeline was 22.7 dB (identical would be infinite), the file shrank 22.5 MB -> 14.8 MB as a blur should, and the output was frame-for-frame identical in GUI and headless. A first attempt that wired ONLY MediaOut -> Blur, leaving the Blur with no source, made the render job come back 'Failed' with an 887-byte file — so an unrooted graph does not merely get bypassed, it can take the render down. What still stands is the original observation for the configuration it actually tested, which is retained below and has NOT been re-measured: AddFusionComp() returns the comp, AddTool/Connect/SetInput all succeed, and the whole graph reads back correctly (GetCompCount 1, MediaOut1.Input wired to the new tool, StyledText returning the value just set) — but the rendered output is byte-for-byte the untouched source media. Verified live on Studio 19.1.3.7 with the strongest form of the test: MediaOut1 fed ONLY by a Text+, with no path from MediaIn at all, still rendered the unmodified clip. LoadFusionCompByName on the sole comp does not activate it either. Contrast InsertFusionTitleIntoTimeline, whose comp DOES render — text set via SetInput('StyledText') appears in the output — so this is specific to comps attached to media-backed clips, not to Fusion through the API generally. REPRODUCED 2026-08-21 on Studio 19.1.3.7: a rooted MediaIn -> Blur -> MediaOut comp built entirely through the API renders (PSNR 24.38 dB vs the no-comp baseline), so the 2026-08-02 correction stands. Note that an important share of 'the comp was ignored' readings are NOT this entry at all but the Composition.Lock bug above — a parameter written under a comp lock reads back correctly and never reaches the render, which looks identical from the API side. That is what an independent 2026-08-20 report on Studio 21.0.4.5 was measuring: a wired MediaIn -> Blur -> MediaOut comp, and a Transform variant, both delivered renders bit-identical to the no-comp baseline (PSNR inf) when built and set through this server. It was read at the time as a version regression (19.1.3.7 honours a wired comp, 21.0.4.5 does not); with the lock bug identified, the simpler reading is that the same defect reproduces on 21.0.4.5 — and since the lock bug has only been isolated on 19.1.3.7, that report is the only evidence it is not build-specific. SETTLED 2026-08-22 on DaVinci Resolve 21.0.3.7 (free edition, driven through the in-app bridge): the same wired MediaIn -> Blur(XBlurSize 20) -> MediaOut comp, with the value written through this server's fixed set_input, RENDERS - PSNR 24.38 dB vs the no-comp baseline and the file shrinking 2,017,973 -> 727,261 bytes, the same figure measured on 19.1.3.7 from the same source. So the 'renders on 19.1.3.7, ignored on 21' split was the Composition.Lock bug on both sides, not a version regression, and 'a wired comp renders' now holds across both Resolve generations tested. The 21 confirmation is a free-edition 21.0.3.7 rather than the Studio 21.0.4.5 the original report used; no Studio 21 was available to test.
+- **Workaround / current handling:** Wire the graph so MediaOut descends from MediaIn — that is the difference between a comp that renders and one that is silently bypassed, and it is what made this look like 'Fusion never renders from the API'. Never leave a tool unrooted: a MediaOut fed by a tool with no source failed the render job outright. For text or effects over picture, insert a Fusion title/generator as its own timeline clip and set its Text+ (fusion_comp set_text_plus), rather than attaching a comp to the media clip. Note the destination track cannot be chosen from the API (see the Track Selector entry), so overlaying onto an existing clip's track is not currently reachable end-to-end. Building the comp in the Fusion page UI works; only the API-created comp is ignored. Never claim a Fusion effect from comp readback alone — prove it with a rendered frame (gallery_stills grab_and_export before/after, or a delivered render). On setups where even the wired comp does not render (see the 2026-08-20 measurement), treat per-item Fusion effects as HITL (a human builds or activates the comp in the UI) and bake stills motion with ffmpeg when unattended output is required.
+- **Tags:** fusion, silent-failure, render, readback, hitl
 
 ### Composition.Paste
 
@@ -453,6 +531,51 @@ values, or automation-hostile modal prompts.
 - **Reference:** [issue #77](https://github.com/samuelgursky/davinci-resolve-mcp/issues/77)
 - **Tags:** unreliable-return, silent-failure, metadata, reel-name
 
+### MediaPool.ImportTimelineFromFile (internal sequence name overrides timelineName)
+
+- **Object:** `MediaPool`
+- **Signature:** `(filePath, {timelineName, importSourceClips, ...}) -> Timeline`
+- **Behavior:** For FCP7 XML, the sequence name INSIDE the file wins over the timelineName import option. When the internal name matches an existing timeline, the call returns that EXISTING timeline — no error, no new timeline — so an export→edit→re-import loop keying uniqueness on the option 'succeeds' while operating on one timeline forever (issue #171, Studio 21.0.4.5; wrapper behavior verified on 19.1.3.7). Distinct from the documented repeated-timelineName None return: here the option is fresh and the file's name is stale. THE NAMING AUTHORITY DIFFERS PER FORMAT (all measured on 19.1.3.7): FCP7 XML ignores timelineName entirely (internal <name> wins); AAF honours timelineName when given and falls back to its internal name; OTIO honours timelineName; and .drt names the timeline after the FILE (see the .drt entry below). Only FCP7 exhibits the returned-existing trap.
+- **Workaround / current handling:** Rewrite the <sequence><name> inside the file to the intended name before importing — timeline.import_timeline_checked does this automatically for FCP7 XML and errors when a non-rewritable format still returns an existing timeline. Never treat a truthy return as proof of creation; check the returned timeline's id against the pre-import set.
+- **Reference:** [issue #171](https://github.com/samuelgursky/davinci-resolve-mcp/issues/171)
+- **Tags:** timeline, import, silent-failure, unreliable-return
+
+### Timeline import MERGES pool media by a coarse identity - similar files can silently cross-link
+
+- **Object:** `ImportTimelineFromFile / media pool`
+- **Behavior:** When a .drt import lands in a project that already holds a media entry whose pool identity blob matches the incoming one, Resolve MERGES them and every clip relinks to the EXISTING media - silently. The identity is coarse: two different files (5.6MB vs 93KB, different names, mtimes 1s apart) had identity blobs byte-identical except internal uuids, and the second file's clips all played the first file's picture (readback showed the wrong clip NAME; measured E33/E34 on 19.1.3.7). Importing the same archive into a FRESH project materialized both files correctly - the merge only bites across imports.
+- **Workaround / current handling:** After importing an authored timeline into a non-empty project, verify per-item file paths (or render probe frames) before trusting the conform - linked==total cannot see a cross-link. Files generated in the same second are the risk class; distinct mtimes distinguish them.
+- **Tags:** import, media-pool, silent-failure, drt
+
+### Audio tracks cannot be grown in an imported timeline; Fairlight strips live in the pool Sm2Sequence.FieldsBlob
+
+- **Object:** `Sm2TiTrack (audio) / FLStudioModelBA`
+- **Behavior:** An audio track added to a SeqContainer by cloning imports fine, reads back fine (track count, items, everything), and renders SILENT. The per-timeline Fairlight model (FLStudioModelBA, ~7KB compressed to ~420KB, inside the media pool's Sm2Sequence.FieldsBlob) holds one strip per audio track, and a track without a strip is mute. Measured by elimination on 19.1.3.7: clip byte-identical to a live-authored one, track byte-identical (SubType is the CHANNEL FORMAT code - 1=mono - not an ordinal), pool entry shared with a playing A1 clip - still silent; only a timeline whose template was CAPTURED with the tracks plays.
+- **Workaround / current handling:** Never clone audio tracks offline. Capture the template with the audio tracks already present (the r19 media template carries 8 mono tracks with valid strips; drt.assemble audioOnly cuts land on them and render at native level). Refuse placements beyond the captured ceiling. Audio aliveness is readback-blind: verify by rendered RMS, not structure.
+- **Tags:** fairlight, audio, import, silent-failure, drt
+
+### MediaTimemapBA keyframes are generation-split; 19.x silently ignores the R21 protobuf form
+
+- **Object:** `Sm2TimeMap (per-clip retime blob)`
+- **Behavior:** Resolve 21 encodes a retimed clip's KeyframesBA as protobuf points; Resolve 19.1.3 encodes it as a keyed-dict of keyed-dict keyframes ({interp, YOut, YIn, Y, XOut, XIn, X}). On import, 19 SILENTLY IGNORES the protobuf form — the clip reads back and plays at 100% with no warning (measured: identical timelines, one per form; protobuf → source 0..96 over 96 frames, keyed → source 0..48 over 96 frames and a live 50% render). The map spans the WHOLE source stretched by 1/speed; the clip's <In>/<Duration> window into it in RECORD frames (srcIn converts by /speed). REVERSE is the same envelope with the Y endpoints swapped - kf0=(0,YMax), kf1=(XMax,0) - and In then measures from the source END: (frames - srcIn - dur*speed)/speed (measured: a reversed srcIn-24 dur-48 cut reads back source 71->23). A FLAT map (both keyframes at the same Y - a freeze) is the one shape where readback and render DIVERGE: the item reads back frozen (source 96..96) but renders MOVING (48/48 unique frames measured). Do not author freezes as flat timemaps. AUDIO clips ignore the timemap entirely: a 50% keyed map on an imported audio clip reads back retimed (source 0..48 over 96 record frames) but RENDERS at 100% - unchanged pitch and spectrum (highpass/lowpass split identical to the 1x reference).
+- **Workaround / current handling:** Author retimes for pre-21 hosts with the keyed form (drt.assemble cuts[].speed does this; encoder byte-exact against a live 19.1.3.7 harvest). Treat any cross-generation timemap as unverified until a readback shows the retimed source range.
+- **Tags:** retime, import, silent-failure, drt
+
+### Imported Fusion comps render via byte-keyed disk cache on 19.x (offline comp edits render black)
+
+- **Object:** `Fusion / render engine`
+- **Behavior:** On Studio 19.1.3.7, a Fusion composition arriving via timeline import renders only when the machine's Fusion disk cache (CacheClip/) holds frames keyed to the comp blob's EXACT bytes. Measured by discrimination: the untouched harvested title rendered its text; the same blob after an IDENTITY recompression — byte-identical Lua, different zlib bytes, verified consistent framing — imported, read back perfectly, and rendered black; a text-patched blob (also byte-verified) rendered black the same way. The live-render fallback for imported comps does not produce frames on 19; 21-generation hosts render imported comps live (the template-splice title/generator primitives were proven there).
+- **Workaround / current handling:** Never edit an imported comp's bytes offline for a 19.x host — no valid re-encoding can hit the cache. Author media offline (renders everywhere via the native-descriptor transplant) and set title text POST-IMPORT with timeline.set_title_text, whose Fusion-comp write path is live-verified on 19.1.3. Built-in GENERATORS are exempt: Sm2TiGenerator clips carry no Fusion comp, and offline-authored Solid Color / SMPTE Color Bar / Grey Scale all render live from an imported .drt (measured YAVG 16 / 104.9 / 125.1 over a 234 white base). Render-verify any imported Fusion TITLE before delivery; structural readback cannot see this.
+- **Tags:** fusion, render, import, silent-failure
+
+### MediaPool.ImportTimelineFromFile (.drt requirements and filename naming)
+
+- **Object:** `MediaPool`
+- **Signature:** `(drtPath, {importSourceClips, ...}) -> Timeline`
+- **Behavior:** Fully mapped by bisection on Studio 19.1.3.7: a .drt IS a .drp that ImportTimelineFromFile accepts — a whole saved-project export renamed .drt imports, clips intact. Requirements: (1) project.xml present; (2) MediaPool/MpFolder.xml present — it holds the Sm2Sequence/Sm2Timeline objects; (3) the SeqContainer keeps its ORIGINAL uuid path — renaming it 'succeeds' with an EMPTY timeline (items=0, no error), the nastiest variant; (4) version stamps at or below the host's ProjectVersion; (5) native blob schema — flat template containers are refused; (6) the source must be a SAVED export (ExportProject snapshots the saved DB state, so an unsaved timeline exports EMPTY tracks). Every Sm2MpTimelineClip block in MpFolder imports as a timeline: extra blocks arrive as ghost empty timelines unless removed (match blocks via the kept container's track <Sequence> DbIds). The imported timeline is named after the FILE, and a refused import can raise a modal dialog that BLOCKS the scripting call until a human dismisses it.
+- **Workaround / current handling:** Follow the recipe: drt.extract_from_drp implements it (original container path, MpFolder carried, ghost blocks removed, Gallery dropped), and drt.assemble authors importable native-schema archives from scratch (template-spliced; pass targetAppVersion on pre-21 hosts). Save the project before ExportProject. Name the timeline by naming the FILE. Never batch speculative .drt imports unattended — one refusal can hold the session hostage behind its dialog; timeline.import_timeline_checked refuses the flat authored shape up front for exactly that reason.
+- **Tags:** timeline, import, silent-failure, headless
+
 ### Timeline.DeleteClips (requires the Edit page; flaky first attempt)
 
 - **Object:** `Timeline`
@@ -524,3 +647,19 @@ values, or automation-hostile modal prompts.
 - **Behavior:** PANEL-dependent, not mode-dependent — and the distinction took three revisions of this entry to pin down, so the evidence is recorded rather than summarised. Across four controlled 92-probe sweeps (2 GUI, 2 headless, 2026-08-01) it returned False and wrote nothing in ALL FOUR, while Timeline.GrabStill() succeeded in all four — so it is not being handed an empty still. In one earlier GUI session it DID work, returning True and writing 2 files. The variable that differed is not the mode: it is whether the Gallery panel was visible on the Color page, which depends on the restored workspace layout and which the harness does not control. A headless session can never satisfy it, so in practice the call never works headless; a GUI session satisfies it only sometimes. Project.ExportCurrentFrameAsStill worked in all four runs in both modes.
 - **Workaround / current handling:** Do not use ExportStills unattended in either mode — a GUI session is not sufficient, only a GUI session with the Gallery panel open. Use Project.ExportCurrentFrameAsStill for pixels (verified in both modes, four for four) or drp.extract_node_graphs for grades. If ExportStills must be used, have the user open Workspace > Gallery first and verify the written files rather than trusting the return.
 - **Tags:** gallery, stills, headless, unreliable-return
+
+### MediaPool.AppendToTimeline (null-id timeline items)
+
+- **Object:** `MediaPool`
+- **Signature:** `([{clipInfo}, ...]) -> [TimelineItem]`
+- **Behavior:** The returned TimelineItem objects can have an unreadable/empty GetUniqueId, notably when the clipInfo recordFrame lands in a span still occupied by another item (any duplicate-then-delete 'move' whose offset is smaller than the item duration hits this). The item may not actually exist on the timeline. A session that trusted the non-empty return and deleted the sources lost 26 clips (Portugal timeline, 2026-08-19).
+- **Workaround / current handling:** Never treat AppendToTimeline's return as proof of placement. Re-enumerate the track and match on record frame + duration before any dependent delete; never shift items by duplicate-then-delete into occupied spans — use timeline.ripple_insert, which rebuilds the tail into free space and verifies by readback.
+- **Tags:** editorial, silent-failure, unreliable-return, timeline
+
+### Project.IsRenderingInProgress (stuck True after deleting the rendering project)
+
+- **Object:** `Project`
+- **Signature:** `() -> Bool`
+- **Behavior:** Deleting or closing a project while its render job is still running orphans the render and wedges the whole render pipeline: the output file stops growing and Resolve idles at 0% CPU, IsRenderingInProgress on the NEXT current project reports True indefinitely, StopRendering does not clear it, NEW render jobs sit at 0% forever (then StartRendering starts returning False), and Resolve.Quit() is refused because the app believes a render is running — even project creation can start returning None behind the quit-confirm dialog (reproduced live on Studio 19.1.3.7, 2026-08-29).
+- **Workaround / current handling:** Never close or delete a project while IsRenderingInProgress is True — StopRendering first, wait for False, then close. Once wedged, only a manual quit (confirming the dialog) or force-quit clears it; treat a True that persists at 0% CPU with a static output file as stuck rather than rendering. Poll GetRenderJobStatus for completion instead of IsRenderingInProgress, which this failure poisons.
+- **Tags:** render, silent-failure, unreliable-return

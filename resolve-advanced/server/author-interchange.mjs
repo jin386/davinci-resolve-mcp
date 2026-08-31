@@ -192,6 +192,298 @@ export function eventsToOTIO(events, opts = {}) {
 }
 
 /** Build a CMX3600 EDL string (cuts + M2 speed). Video events only, per EDL convention. */
+/**
+ * eventsToAssembleSpec — normalized interchange events → drt.assemble media spec.
+ *
+ * The coast-to-coast bridge: parseInterchange's events (EDL/AAF/OTIO/XML)
+ * become an importable, RENDERING native .drt via assembleTimeline's
+ * transplant path. Frame math: event frames are NOMINAL-base at the event's
+ * fps (v2.104.6 convention, measured against Resolve); the assemble template
+ * timeline runs 24fps with origin 86400, so rec/src frames convert as
+ * round(frames × 24 / nominalFps). Placement anchors the EARLIEST video
+ * event at the origin. Honesty ledger in the returned report: flattened
+ * zero-speed freezes (constant retimes — forward AND reverse — are AUTHORED
+ * as real Sm2TimeMaps, r19 keyed form, readback/render-verified), authored vs
+ * dropped transitions (cross-dissolves are AUTHORED when the predecessor
+ * abuts the cut and both sides have handle media — render-verified on
+ * 19.1.3.7; otherwise dropped with the reason, as a cut at the boundary),
+ * and audio: A-track events are AUTHORED as audioOnly cuts on their own
+ * audio tracks (render-verified; the template carries 8 Fairlight-valid
+ * audio tracks) — their presence suppresses the A1 convenience mirror.
+ *
+ * @param {Array} events - normalized events (parseInterchange shape)
+ * @param {object} opts
+ * @param {Object<string,{mediaFilePath:string, spec:object}>} opts.sourceMap -
+ *   event.source (reel) → media file + spec. Every VIDEO event's source must
+ *   be mapped; unmapped reels refuse with the reel names listed.
+ * @param {string} [opts.timelineName]
+ * @returns {{spec: object, report: object}}
+ */
+export function eventsToAssembleSpec(events, opts = {}) {
+  const { sourceMap, timelineName, preserveStartTimecode = false } = opts;
+  if (!Array.isArray(events) || !events.length) {
+    throw new TypeError('eventsToAssembleSpec: events must be a non-empty array');
+  }
+  if (!sourceMap || typeof sourceMap !== 'object') {
+    throw new TypeError('eventsToAssembleSpec: sourceMap {reel: {mediaFilePath, spec}} is required');
+  }
+  const DEFAULT_ORIGIN = 86400;
+  const isAudio = (t) => /^A\d*$/.test(String(t || ''));
+  const isMarker = (t) => t === 'MARKER';
+  const vids = events.filter((e) => !isAudio(e.track) && !isMarker(e.track) && e.recIn != null && e.recOut != null);
+  // AAF exports one event per audio CHANNEL — a stereo/dual-mono clip arrives
+  // as identical A-track legs (measured on a Resolve 19 rich export: every
+  // audio event duplicated). Merge exact duplicates (same track/source/range)
+  // so they place once instead of refusing as a same-track overlap.
+  const audsRaw = events.filter((e) => isAudio(e.track) && e.recIn != null && e.recOut != null);
+  const seenAud = new Set();
+  const auds = [];
+  let audioChannelLegsMerged = 0;
+  for (const e of audsRaw) {
+    const k = `${e.track}|${e.source}|${e.recIn}|${e.recOut}|${e.srcIn}`;
+    if (seenAud.has(k)) { audioChannelLegsMerged += 1; continue; }
+    seenAud.add(k);
+    auds.push(e);
+  }
+  const markerEvents = events.filter((e) => isMarker(e.track) && e.recIn != null);
+  const audioSkipped = events.length - vids.length - audsRaw.length - markerEvents.length;
+  if (!vids.length) throw new Error('eventsToAssembleSpec: no video events with record ranges');
+
+  const unmapped = [...new Set([...vids, ...auds].map((e) => e.source).filter((srcName) => !sourceMap[srcName]))];
+  if (unmapped.length) {
+    throw new Error(
+      `eventsToAssembleSpec: unmapped source reel(s): ${unmapped.join(', ')} — ` +
+      'every video event needs a sourceMap entry {mediaFilePath, spec}',
+    );
+  }
+
+  const toTl = (frames, fps) => Math.round((frames * 24) / Math.round(fps || 24));
+  // 'V'/'V1' → 1, 'V2' → 2, … (parsers number video tracks; EDL is single-V).
+  const trackNum = (t) => { const m = /^V(\d+)?$/.exec(String(t || 'V')); return m ? (m[1] ? parseInt(m[1], 10) : 1) : 1; };
+  const flattenedRetimes = [];
+  const authoredRetimes = [];
+  const droppedTransitions = [];
+  const transitionCandidates = [];
+  const perSource = new Map();
+  const placements = [];
+
+  // Default: anchor the earliest event at the template origin (86400).
+  // preserveStartTimecode keeps the interchange's ABSOLUTE record positions —
+  // the assembled timeline starts at the turnover's real first record frame
+  // (MediaExtents start-TC patch, measured: imports with the new start TC and
+  // renders). AAF conforms need this: build at THAT start, not 01:00:00:00.
+  const minRecRaw = Math.min(...vids.map((e) => toTl(e.recIn, e.fps)));
+  const minRec = preserveStartTimecode ? 0 : minRecRaw;
+  const ORIGIN = preserveStartTimecode ? 0 : DEFAULT_ORIGIN;
+  const startFrame = preserveStartTimecode ? minRecRaw : DEFAULT_ORIGIN;
+  for (const e of vids) {
+    const recIn = ORIGIN + (toTl(e.recIn, e.fps) - minRec);
+    const recOut = ORIGIN + (toTl(e.recOut, e.fps) - minRec);
+    const durationFrames = recOut - recIn;
+    if (durationFrames <= 0) continue;
+    const vTrack = trackNum(e.track);
+    const cut = { startFrame: recIn, durationFrames, srcIn: toTl(e.srcIn ?? 0, e.fps), ...(vTrack > 1 ? { track: vTrack } : {}) };
+    if ((e.speed ?? 100) !== 100 || e.reverse) {
+      const spd = Math.abs(e.speed ?? 100);
+      if (!(spd > 0)) {
+        flattenedRetimes.push({ index: e.index, source: e.source, speed: e.speed, reverse: !!e.reverse, reason: 'zero speed (freeze) not supported — played forward at 100%' });
+      } else {
+        // Constant speed, forward or reverse: authored as a real Sm2TimeMap
+        // on the cut (r19 keyed form; readback/render-verified on 19.1.3.7 —
+        // reverse reads back source 71→23 for a srcIn-24 dur-48 cut). Audio
+        // for retimed cuts is video-only downstream.
+        if (spd !== 100) cut.speed = spd / 100;
+        if (e.reverse) cut.reverse = true;
+        authoredRetimes.push({ index: e.index, source: e.source, speed: spd, ...(e.reverse ? { reverse: true } : {}) });
+      }
+    }
+    if (e.transition) {
+      // A dissolve INTO this event, at its record-in boundary. Whether it can
+      // be authored (abutting predecessor + handles both sides) is decided
+      // after all placements are known.
+      let d = Math.max(2, toTl(e.transition.duration || 0, e.fps) || 2);
+      d += d % 2; // placeTransition centers on the cut; keep it even
+      transitionCandidates.push({
+        atFrame: recIn, durationFrames: d, track: vTrack,
+        index: e.index, type: e.transition.type, rawDuration: e.transition.duration,
+        source: e.source, srcIn: cut.srcIn,
+      });
+    }
+    placements.push({ start: recIn, end: recOut, index: e.index, source: e.source, srcIn: cut.srcIn, durationFrames, track: vTrack });
+    if (!perSource.has(e.source)) perSource.set(e.source, []);
+    perSource.get(e.source).push(cut);
+  }
+
+  // Audio events become explicit audioOnly cuts on their own audio tracks —
+  // this SUPPRESSES the convenience A1 mirror downstream (explicit audio
+  // wins). Render-verified on 19.1.3.7: an offline A3 cut plays at the
+  // native control level through the captured 8-audio-track template's
+  // Fairlight strips. Retimed audio is not authored (no audio timemap yet).
+  const audioTrackNum = (t) => { const m = /^A(\d+)?$/.exec(String(t)); return m && m[1] ? parseInt(m[1], 10) : 1; };
+  const audioPlacements = [];
+  const audioRetimesSkipped = [];
+  const audioTransCandidates = [];
+  for (const e of auds) {
+    const recIn = ORIGIN + (toTl(e.recIn, e.fps) - minRec);
+    const recOut = ORIGIN + (toTl(e.recOut, e.fps) - minRec);
+    const durationFrames = recOut - recIn;
+    if (durationFrames <= 0) continue;
+    if ((e.speed ?? 100) !== 100 || e.reverse) {
+      audioRetimesSkipped.push({ index: e.index, source: e.source, speed: e.speed, reverse: !!e.reverse, reason: 'audio retime not authorable — the audio engine ignores the clip timemap (measured: reads back retimed, renders 100%); played at 100%' });
+    }
+    const track = audioTrackNum(e.track);
+    const cut = { startFrame: recIn, durationFrames, srcIn: toTl(e.srcIn ?? 0, e.fps), audioOnly: true, track };
+    if (e.transition) {
+      let d = Math.max(2, toTl(e.transition.duration || 0, e.fps) || 2);
+      d += d % 2;
+      audioTransCandidates.push({
+        atFrame: recIn, durationFrames: d, track,
+        index: e.index, type: e.transition.type, rawDuration: e.transition.duration,
+        source: e.source, srcIn: cut.srcIn,
+      });
+    }
+    audioPlacements.push({ start: recIn, end: recOut, index: e.index, track, source: e.source, srcIn: cut.srcIn, durationFrames });
+    if (!perSource.has(e.source)) perSource.set(e.source, []);
+    perSource.get(e.source).push(cut);
+  }
+  audioPlacements.sort((a, b) => a.start - b.start);
+  const audByTrack = new Map();
+  for (const pl of audioPlacements) {
+    if (!audByTrack.has(pl.track)) audByTrack.set(pl.track, []);
+    audByTrack.get(pl.track).push(pl);
+  }
+  for (const [trk, pls] of audByTrack) {
+    for (let i = 1; i < pls.length; i += 1) {
+      if (pls[i].start < pls[i - 1].end) {
+        throw new Error(
+          `eventsToAssembleSpec: audio events ${pls[i - 1].index} and ${pls[i].index} ` +
+          `overlap on audio track ${trk} after frame conversion — one track cannot hold both.`);
+      }
+    }
+  }
+
+  // Overlap is judged PER VIDEO TRACK — V2 stacking over V1 is legitimate
+  // conform geometry (render-verified: an upper-track clip covers the lower).
+  placements.sort((a, b) => a.start - b.start);
+  const byTrack = new Map();
+  for (const pl of placements) {
+    if (!byTrack.has(pl.track)) byTrack.set(pl.track, []);
+    byTrack.get(pl.track).push(pl);
+  }
+  for (const [trk, pls] of byTrack) {
+    for (let i = 1; i < pls.length; i += 1) {
+      if (pls[i].start < pls[i - 1].end) {
+        throw new Error(
+          `eventsToAssembleSpec: events ${pls[i - 1].index} and ${pls[i].index} ` +
+          `overlap on video track ${trk} after frame conversion — one track cannot hold both. ` +
+          'Resolve the overlap upstream (transitions count as cuts at their boundary here).',
+        );
+      }
+    }
+  }
+
+  // Reel aliasing: multiple reels legitimately map to ONE file (Avid mob
+  // names vs tape names, re-linked dailies). Group by mediaFilePath so the
+  // assembly sees one source per FILE, not per reel.
+  const byFile = new Map();
+  for (const [reel, cuts] of perSource.entries()) {
+    const fp = sourceMap[reel].mediaFilePath;
+    if (!byFile.has(fp)) byFile.set(fp, { mediaFilePath: fp, spec: sourceMap[reel].spec, cuts: [] });
+    byFile.get(fp).cuts.push(...cuts);
+  }
+  const media = [...byFile.values()];
+
+  // Author cross-dissolves where the geometry allows it (render-verified on
+  // 19.1.3.7: an offline Sm2TiTransition over transplanted cross-source media
+  // blends 124→181.6→234 at the cut — transitions carry no Fusion comp, so
+  // the byte-keyed comp-cache law does not apply). A candidate is authorable
+  // when a predecessor ends EXACTLY at its cut and both sides have handle
+  // media for the centered span; anything else stays in droppedTransitions
+  // with the reason.
+  const transitions = [];
+  for (const c of transitionCandidates) {
+    const prev = placements.find((pl) => pl.track === c.track && pl.end === c.atFrame);
+    if (!prev) {
+      droppedTransitions.push({ index: c.index, type: c.type, duration: c.rawDuration, reason: 'no abutting predecessor at the cut' });
+      continue;
+    }
+    const half = c.durationFrames / 2;
+    const bHandle = c.srcIn >= half;
+    const aSpec = sourceMap[prev.source] && sourceMap[prev.source].spec;
+    const aFrames = aSpec && Number(aSpec.frameCount);
+    const aHandle = Number.isFinite(aFrames) ? prev.srcIn + prev.durationFrames + half <= aFrames : false;
+    if (!bHandle || !aHandle) {
+      droppedTransitions.push({
+        index: c.index, type: c.type, duration: c.rawDuration,
+        reason: `insufficient handles for a centered ${c.durationFrames}f dissolve` +
+          `${bHandle ? '' : ' (incoming srcIn < half)'}${aHandle ? '' : ' (outgoing tail media < half)'}`,
+      });
+      continue;
+    }
+    transitions.push({ track: c.track, atFrame: c.atFrame, durationFrames: c.durationFrames });
+  }
+  // Audio cross-fades, same geometry rules (render-verified on 19.1.3.7 via
+  // the harvested cross-fade template: the highpass RMS ramps, not steps).
+  for (const c of audioTransCandidates) {
+    const prev = audioPlacements.find((pl) => pl.track === c.track && pl.end === c.atFrame);
+    if (!prev) {
+      droppedTransitions.push({ index: c.index, type: c.type, duration: c.rawDuration, trackType: 'audio', reason: 'no abutting predecessor at the cut' });
+      continue;
+    }
+    const half = c.durationFrames / 2;
+    const bHandle = c.srcIn >= half;
+    const aSpec = sourceMap[prev.source] && sourceMap[prev.source].spec;
+    const aFrames = aSpec && Number(aSpec.frameCount);
+    const aHandle = Number.isFinite(aFrames) ? prev.srcIn + prev.durationFrames + half <= aFrames : false;
+    if (!bHandle || !aHandle) {
+      droppedTransitions.push({
+        index: c.index, type: c.type, duration: c.rawDuration, trackType: 'audio',
+        reason: `insufficient handles for a centered ${c.durationFrames}f cross-fade` +
+          `${bHandle ? '' : ' (incoming srcIn < half)'}${aHandle ? '' : ' (outgoing tail media < half)'}`,
+      });
+      continue;
+    }
+    transitions.push({ track: c.track, atFrame: c.atFrame, durationFrames: c.durationFrames, trackType: 'audio' });
+  }
+
+  // Turnover markers (EDL * LOC: locators, OTIO Marker objects) → authored
+  // timeline markers. Interchange colors map to the measured Resolve names;
+  // unknown colors fall back to Blue. Frames are timeline-absolute like cuts.
+  const COLOR_MAP = {
+    blue: 'Blue', cyan: 'Cyan', green: 'Green', yellow: 'Yellow', red: 'Red',
+    pink: 'Pink', purple: 'Purple', magenta: 'Fuchsia', fuchsia: 'Fuchsia',
+    rose: 'Rose', lavender: 'Lavender', sky: 'Sky', mint: 'Mint',
+    lemon: 'Lemon', sand: 'Sand', cocoa: 'Cocoa', cream: 'Cream',
+    orange: 'Sand', white: 'Cream', black: 'Cocoa',
+  };
+  const markers = markerEvents
+    .map((e) => ({
+      frame: ORIGIN + (toTl(e.recIn, e.fps) - minRec),
+      color: COLOR_MAP[String(e.color || '').toLowerCase()] || 'Blue',
+      ...(e.name ? { name: e.name } : {}),
+    }))
+    .filter((m) => m.frame >= (preserveStartTimecode ? startFrame : DEFAULT_ORIGIN));
+
+  return {
+    spec: { timelineName, media, ...(preserveStartTimecode ? { startFrame } : {}), ...(markers.length ? { markers } : {}), ...(transitions.length ? { transitions } : {}) },
+    report: {
+      videoEvents: vids.length,
+      sources: media.length,
+      audioEventsSkipped: audioSkipped,
+      authoredMarkers: markers.length,
+      audioChannelLegsMerged,
+      authoredAudioEvents: audioPlacements.length,
+      audioRetimesSkipped,
+      upperTrackCutsVideoOnly: placements.filter((pl) => pl.track > 1).length,
+      flattenedRetimes,
+      authoredRetimes,
+      authoredTransitions: transitions,
+      droppedTransitions,
+      origin: startFrame,
+    },
+  };
+}
+
 export function eventsToEDL(events, opts = {}) {
   const fps = opts.fps || events.find((e) => e.fps)?.fps || 24;
   const vids = events.filter((e) => e.track !== 'A').sort((a, b) => (a.recIn ?? 0) - (b.recIn ?? 0));
@@ -287,4 +579,63 @@ export async function authorInterchange(events, target, opts = {}) {
     return { target: 'drt', spec, buffer: buf, bytes: buf.length, flattened: drtFlattenedRetimes(events) };
   }
   throw new Error(`authorInterchange: unknown target '${target}' (otio|edl|drt)`);
+}
+
+/**
+ * verifyRoundtrip — assert that a re-EXPORT of an authored timeline matches
+ * the interchange it was built from, normalizing the three cross-format
+ * conventions measured on a live AAF→assemble→import→OTIO-export loop
+ * (19.1.3.7):
+ *   1. track labels: first tracks read 'V'/'A' in one format, 'V1'/'A1' in
+ *      the other — canonicalized to the numbered form;
+ *   2. source names: AAF mob name vs file basename ('rt_source_1' vs
+ *      'rt_source_1.mov') — compared after stripping the extension,
+ *      case-insensitively;
+ *   3. source frames: Resolve's OTIO export is TIMECODE-ABSOLUTE while
+ *      event lists are usually source-relative — a CONSTANT per-source
+ *      offset is fitted from the first pair and every other pair must agree
+ *      (the offset itself is reported, e.g. 86400 for a 01:00:00:00 source).
+ * Record positions are min-anchored per side. Video events only (audio
+ * channel legs merge by design).
+ *
+ * @returns {{pass:boolean, pairs:number, srcOffsets:Object, mismatches:Array}}
+ */
+export function verifyRoundtrip(inputEvents, exportedEvents, opts = {}) {
+  const recTol = opts.recTol ?? 1;
+  const srcTol = opts.srcTol ?? 1;
+  const canonTrack = (t) => {
+    const m = /^([VA])(\d+)?$/.exec(String(t || ''));
+    return m ? `${m[1]}${m[2] || '1'}` : String(t);
+  };
+  const canonSource = (x) => String(x || '').replace(/\.[^.]+$/, '').toLowerCase();
+  const vids = (evts) => evts.filter((e) => /^V\d*$/.test(String(e.track)) && e.recIn != null && e.recOut != null);
+  const norm = (evts) => {
+    const v = vids(evts);
+    if (!v.length) return [];
+    const off = Math.min(...v.map((e) => e.recIn));
+    return v
+      .map((e) => ({ track: canonTrack(e.track), source: canonSource(e.source), recIn: e.recIn - off, recOut: e.recOut - off, srcIn: e.srcIn ?? 0 }))
+      .sort((a, b) => a.track.localeCompare(b.track) || a.recIn - b.recIn);
+  };
+  const a = norm(inputEvents);
+  const b = norm(exportedEvents);
+  const mismatches = [];
+  if (a.length !== b.length) mismatches.push({ kind: 'count', input: a.length, exported: b.length });
+  const srcOffsets = {};
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i += 1) {
+    const x = a[i], y = b[i];
+    if (x.track !== y.track) { mismatches.push({ kind: 'track', at: i, input: x.track, exported: y.track }); continue; }
+    if (x.source !== y.source) { mismatches.push({ kind: 'source', at: i, input: x.source, exported: y.source }); continue; }
+    if (Math.abs(x.recIn - y.recIn) > recTol || Math.abs(x.recOut - y.recOut) > recTol) {
+      mismatches.push({ kind: 'record', at: i, input: [x.recIn, x.recOut], exported: [y.recIn, y.recOut] });
+      continue;
+    }
+    const off = y.srcIn - x.srcIn;
+    if (srcOffsets[x.source] === undefined) srcOffsets[x.source] = off;
+    else if (Math.abs(off - srcOffsets[x.source]) > srcTol) {
+      mismatches.push({ kind: 'source-frames', at: i, source: x.source, expectedOffset: srcOffsets[x.source], gotOffset: off });
+    }
+  }
+  return { pass: mismatches.length === 0, pairs: n, srcOffsets, mismatches };
 }

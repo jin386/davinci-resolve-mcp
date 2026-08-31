@@ -978,9 +978,15 @@ def modify_keyframe(timeline_item_id: str, property_name: str, frame: int, new_v
             if new_frame < start_frame or new_frame > end_frame:
                 return f"Error: New frame {new_frame} is outside the item's range ({start_frame} to {end_frame})"
                 
-            # Delete the keyframe at the current frame
+            # Delete the keyframe at the current frame. A discarded False here
+            # leaves the ORIGINAL keyframe in place; the AddKeyframe below then
+            # succeeds at the new frame and the tool reports "moved" for what is
+            # actually a copy.
             current_value = timeline_item.GetPropertyAtKeyframeIndex(property_name, keyframe_index)
-            timeline_item.DeleteKeyframe(property_name, frame)
+            if not timeline_item.DeleteKeyframe(property_name, frame):
+                return (f"Failed to move keyframe for {property_name}: DeleteKeyframe "
+                        f"refused frame {frame}, so the original is still there and "
+                        f"nothing was moved")
             
             # Add a new keyframe at the new frame position with the current value (or new value if specified)
             value = new_value if new_value is not None else current_value
@@ -991,9 +997,13 @@ def modify_keyframe(timeline_item_id: str, property_name: str, frame: int, new_v
             else:
                 return f"Failed to move keyframe for {property_name}"
         else:
-            # Only changing the value, not the frame position
-            # We need to delete and re-add the keyframe with the new value
-            timeline_item.DeleteKeyframe(property_name, frame)
+            # Only changing the value, not the frame position: delete and
+            # re-add. A discarded False leaves the OLD value in place and
+            # AddKeyframe on an occupied frame is not a value update.
+            if not timeline_item.DeleteKeyframe(property_name, frame):
+                return (f"Failed to update keyframe value for {property_name} at frame "
+                        f"{frame}: DeleteKeyframe refused, so the old value is still "
+                        f"there and nothing was changed")
             result = timeline_item.AddKeyframe(property_name, frame, new_value)
             
             if result:
@@ -1171,8 +1181,12 @@ def set_keyframe_interpolation(timeline_item_id: str, property_name: str, frame:
                 value = timeline_item.GetPropertyAtKeyframeIndex(property_name, i)
                 break
         
-        # Delete the old keyframe
-        timeline_item.DeleteKeyframe(property_name, frame)
+        # Delete the old keyframe. A discarded False leaves the original
+        # interpolation in place and the tool still reports success.
+        if not timeline_item.DeleteKeyframe(property_name, frame):
+            return (f"Failed to set interpolation for {property_name} at frame {frame}: "
+                    f"DeleteKeyframe refused, so the original keyframe and its "
+                    f"interpolation are unchanged")
         
         # Add a new keyframe with the same value but different interpolation
         result = timeline_item.AddKeyframe(property_name, frame, value, interpolation_map[interpolation_type])
@@ -1926,17 +1940,34 @@ def ti_load_burn_in_preset(preset_name: str, item_index: int = 0, track_type: st
 
 
 @mcp.tool()
-def ti_create_magic_mask(mode: str = "Forward", item_index: int = 0, track_type: str = "video", track_index: int = 1) -> Dict[str, Any]:
+def ti_create_magic_mask(mode: str = "F", item_index: int = 0, track_type: str = "video", track_index: int = 1) -> Dict[str, Any]:
     """Create a Magic Mask on a timeline item.
 
+    Magic Mask v2 needs operator CLICKS on the subject (Color page > Magic Mask
+    palette > click subject > Track Forward); the API cannot place them, so with
+    no clicks present Resolve returns False and no isolation exists.
+
     Args:
-        mode: 'Forward' or 'Backward'. Default: 'Forward'.
+        mode: 'F' (forward), 'B' (backward), or 'BI' (bidirection) per the
+            scripting README ('Forward'/'Backward' are accepted as aliases).
         item_index: 0-based item index. Default: 0.
     """
+    aliases = {"F": "F", "FORWARD": "F", "B": "B", "BACKWARD": "B",
+               "BI": "BI", "BIDIRECTION": "BI", "BIDIRECTIONAL": "BI"}
+    normalized = aliases.get(str(mode).strip().upper())
+    if not normalized:
+        return {"error": "mode must be 'F', 'B', or 'BI'"}
     item, err = _get_timeline_item(track_type, track_index, item_index)
     if err:
         return err
-    return {"success": bool(item.CreateMagicMask(mode))}
+    if bool(item.CreateMagicMask(normalized)):
+        return {"success": True, "mode": normalized}
+    return {
+        "success": False,
+        "needs_hitl": True,
+        "hitl": "No Magic Mask clicks on this item — a human must click the subject "
+                "on the Color page Magic Mask palette, then press Track Forward.",
+    }
 
 
 @mcp.tool()

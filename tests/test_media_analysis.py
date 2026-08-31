@@ -13,6 +13,7 @@ import unittest.mock
 from typing import Any, Dict, Optional
 
 from src import server as _server_module
+from src.utils import media_analysis as _media_analysis_module
 from src.server import (
     _apply_media_analysis_clip_markers,
     _apply_sync_event_markers,
@@ -4071,6 +4072,228 @@ class MediaAnalysisPlanningTests(unittest.TestCase):
             self.assertEqual(index["counts"]["clips"], 2)
             self.assertGreaterEqual(search["result_count"], 1)
 
+    def test_batch_job_slice_reports_whisper_timeout_as_failed_clip(self):
+        """A wall-clock transcription timeout must not count as a succeeded clip."""
+        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+            self.skipTest("ffmpeg/ffprobe not installed")
+        timeout_payload = {
+            "success": False,
+            "status": "wall_clock_timeout",
+            "backend": "whisper_cli",
+            "reason": "wall-clock timeout after 90s",
+            "elapsed_ms": 90000,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir = os.path.join(tmp, "source")
+            analysis_dir = os.path.join(tmp, "analysis")
+            os.makedirs(source_dir)
+            source = os.path.join(source_dir, "job_timeout.mp4")
+            self._write_synthetic_media(source)
+            records = [{
+                "clip_id": "clip-timeout",
+                "clip_name": "job_timeout.mp4",
+                "file_path": source,
+                "media_id": "media-timeout",
+            }]
+            params = {
+                "analysis_root": analysis_dir,
+                "depth": "quick",
+                "transcription": {"enabled": True, "backend": "mock"},
+                "vision": {"enabled": False},
+            }
+            created = create_batch_job(
+                project_name="Example Project",
+                project_id="project-job-timeout",
+                records=records,
+                target={"type": "file_list"},
+                params=params,
+                name="Timeout batch",
+            )
+            self.assertTrue(created["success"])
+            job = created["job"]
+            captured = {}
+            real_execute_plan = execute_plan
+
+            def _capture_execute_plan(*args, **kwargs):
+                manifest = real_execute_plan(*args, **kwargs)
+                captured["manifest"] = manifest
+                return manifest
+
+            with unittest.mock.patch.object(
+                _media_analysis_module, "_transcribe", return_value=timeout_payload
+            ), unittest.mock.patch(
+                "src.utils.media_analysis_jobs.execute_plan",
+                side_effect=_capture_execute_plan,
+            ):
+                slice_result = run_batch_job_slice(job["project_root"], job["job_id"], max_clips=1)
+
+            self.assertIn("manifest", captured)
+            clip_result = (captured["manifest"].get("clips") or [{}])[0]
+            self.assertFalse(
+                clip_result.get("success"),
+                "transcription timeout must not mark clip_result.success True",
+            )
+            self.assertEqual((slice_result.get("processed") or [{}])[0].get("status"), "failed")
+            final = batch_job_status(job["project_root"], job["job_id"])
+            self.assertEqual(final["failed_clips"], 1)
+            self.assertEqual(final["succeeded_clips"], 0)
+            self.assertTrue(final.get("last_error"), "job last_error must be set on transcription timeout")
+            self.assertNotEqual(final["status"], "completed")
+
+    def test_declined_transcription_does_not_poison_cache_reuse(self):
+        """A skipped transcript is a missing layer only if a re-run could fix it.
+
+        Transcription is enabled by default and allow_model_download is not, so
+        a stock install writes a declined "skipped" transcript into every
+        report. Counting that as a missing layer made every cached report
+        reusable=False forever — full re-analysis on every call that could
+        never produce the transcript either.
+        """
+        from src.utils.media_analysis import _report_missing_layers
+
+        base_report = {"technical": {"ok": True}, "clip_analysis_markers": [{"m": 1}]}
+        declined = {
+            "success": False, "status": "skipped", "backend": "whisper_cli",
+            "reason": "Local transcription may download model files; set allow_model_download=true explicitly to run it.",
+        }
+        cases = [
+            # (name, cached transcript, transcription options, expect_missing)
+            ("declined skip, no opt-in: report is as complete as a re-run",
+             declined, {"enabled": True, "backend": "whisper_cli"}, False),
+            ("declined skip, opted in now: re-run would transcribe",
+             declined, {"enabled": True, "backend": "whisper_cli", "allow_model_download": True}, True),
+            ("declined skip, mock backend always attempts",
+             declined, {"enabled": True, "backend": "mock"}, True),
+            ("wall-clock timeout is a real attempt; retry may fix it",
+             {"success": False, "status": "wall_clock_timeout", "reason": "90s"},
+             {"enabled": True, "backend": "whisper_cli"}, True),
+            ("caps refusal is a real attempt",
+             {"success": False, "status": "caps_exhausted", "reason": "cap"},
+             {"enabled": True, "backend": "whisper_cli"}, True),
+            ("no transcript key at all (old report)",
+             None, {"enabled": True, "backend": "whisper_cli"}, True),
+            ("real transcript satisfies the layer",
+             {"success": True, "backend": "whisper_cli", "segments": [{"text": "hi"}]},
+             {"enabled": True, "backend": "whisper_cli", "allow_model_download": True}, False),
+            ("disabled-run cache, request still not opting in",
+             {"success": True, "status": "skipped", "reason": "transcription disabled"},
+             {"enabled": True, "backend": "whisper_cli"}, False),
+            ("disabled-run cache, request now opting in",
+             {"success": True, "status": "skipped", "reason": "transcription disabled"},
+             {"enabled": True, "backend": "whisper_cli", "allow_model_download": True}, True),
+            ("whisper_cpp never attempts (not_implemented), even opted in",
+             declined, {"enabled": True, "backend": "whisper_cpp", "allow_model_download": True}, False),
+            ("transcription disabled: never missing",
+             declined, {"enabled": False}, False),
+        ]
+        for name, transcript, transcription, expect_missing in cases:
+            with self.subTest(case=name):
+                report = dict(base_report)
+                if transcript is not None:
+                    report["transcription"] = transcript
+                missing = _report_missing_layers(report, "quick", {"transcription": transcription})
+                if expect_missing:
+                    self.assertIn("transcription", missing)
+                else:
+                    self.assertNotIn("transcription", missing)
+
+    def _run_single_clip_batch_with_transcript(self, tmp, payload):
+        """Run a one-clip batch whose _transcribe returns `payload`."""
+        source_dir = os.path.join(tmp, "source")
+        os.makedirs(source_dir)
+        source = os.path.join(source_dir, "job_transcript.mp4")
+        self._write_synthetic_media(source)
+        created = create_batch_job(
+            project_name="Example Project",
+            project_id="project-job-transcript",
+            records=[{
+                "clip_id": "clip-transcript",
+                "clip_name": "job_transcript.mp4",
+                "file_path": source,
+                "media_id": "media-transcript",
+            }],
+            target={"type": "file_list"},
+            params={
+                "analysis_root": os.path.join(tmp, "analysis"),
+                "depth": "quick",
+                "transcription": {"enabled": True},
+                "vision": {"enabled": False},
+            },
+            name="Transcript batch",
+        )
+        self.assertTrue(created["success"])
+        job = created["job"]
+        with unittest.mock.patch.object(
+            _media_analysis_module, "_transcribe", return_value=payload
+        ):
+            run_batch_job_slice(job["project_root"], job["job_id"], max_clips=1)
+        return batch_job_status(job["project_root"], job["job_id"])
+
+    def test_unavailable_transcription_backend_does_not_fail_the_clip(self):
+        """An install with no Whisper backend must not fail every batch clip.
+
+        Transcription is enabled by default and allow_model_download is off by
+        default, so _transcribe returns success False / status "skipped" on a
+        stock install. Counting that as a clip failure would fail every clip of
+        every batch for most users.
+        """
+        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+            self.skipTest("ffmpeg/ffprobe not installed")
+        for reason, payload in (
+            ("no backend available", {
+                "success": False,
+                "status": "skipped",
+                "reason": "No local transcription backend available",
+            }),
+            ("model download not opted into", {
+                "success": False,
+                "status": "skipped",
+                "backend": "whisper_cli",
+                "reason": "Local transcription may download model files; set allow_model_download=true explicitly to run it.",
+            }),
+            ("backend not implemented", {
+                "success": False,
+                "status": "not_implemented",
+                "backend": "whisper_cpp",
+                "reason": "whisper_cpp execution needs per-install CLI validation before enabling.",
+            }),
+        ):
+            with self.subTest(reason=reason):
+                with tempfile.TemporaryDirectory() as tmp:
+                    final = self._run_single_clip_batch_with_transcript(tmp, payload)
+                self.assertEqual(final["succeeded_clips"], 1)
+                self.assertEqual(final["failed_clips"], 0)
+                self.assertEqual(final["status"], "completed")
+                self.assertFalse(final.get("last_error"))
+
+    def test_transcription_backend_error_still_fails_the_clip(self):
+        """A backend that ran and broke is a real failure, status or not."""
+        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+            self.skipTest("ffmpeg/ffprobe not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            final = self._run_single_clip_batch_with_transcript(tmp, {
+                "success": False,
+                "backend": "whisper_cli",
+                "error": "whisper exited 1",
+            })
+        self.assertEqual(final["failed_clips"], 1)
+        self.assertEqual(final["succeeded_clips"], 0)
+        self.assertTrue(final.get("last_error"))
+
+    def test_caps_refusal_still_fails_the_clip(self):
+        """A caps refusal is a deliberate stop the caller has to be told about."""
+        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+            self.skipTest("ffmpeg/ffprobe not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            final = self._run_single_clip_batch_with_transcript(tmp, {
+                "success": False,
+                "status": "caps_exhausted",
+                "reason": "daily vision-token cap reached",
+            })
+        self.assertEqual(final["failed_clips"], 1)
+        self.assertEqual(final["succeeded_clips"], 0)
+        self.assertTrue(final.get("last_error"))
+
     def test_batch_job_cancel_and_resume(self):
         with tempfile.TemporaryDirectory() as tmp:
             source_dir = os.path.join(tmp, "source")
@@ -4243,7 +4466,11 @@ class MediaAnalysisCoverageTests(unittest.TestCase):
                 with_transcription=False,
             )
 
-            # Request requires transcription — report is incomplete
+            # Request requires transcription AND could produce it (model
+            # download opted in) — the transcript-less report is incomplete.
+            # An enabled request that could NOT run a backend would treat the
+            # report as complete instead; see
+            # test_declined_transcription_does_not_poison_cache_reuse.
             coverage = build_coverage_report(
                 project_name="Missing Layer Project",
                 project_id="v1",
@@ -4252,7 +4479,7 @@ class MediaAnalysisCoverageTests(unittest.TestCase):
                 params={
                     "analysis_root": analysis_root,
                     "depth": "standard",
-                    "transcription": {"enabled": True},
+                    "transcription": {"enabled": True, "allow_model_download": True},
                 },
                 capabilities=self._base_capabilities(),
             )
@@ -5016,6 +5243,95 @@ class MediaAnalysisAsyncModeTests(unittest.TestCase):
             _media_analysis_async_mode({"prefer_handle": True, "dry_run": True}, dry_run_explicit=False),
             "queued",
         )
+
+
+class LoudnessParsingTests(unittest.TestCase):
+    """`_parse_loudness` must read the summary block, not whatever printed last.
+
+    `ebur128` emits a progress line per frame carrying its own `I:`, `LRA:` and peak
+    fields. A last-match-wins read over the whole stream is right only because the
+    summary happens to print last, and a measurement that is correct because of output
+    ordering is one ffmpeg change away from being quietly wrong — the numbers still
+    parse, they are just of a single frame instead of the programme.
+    """
+
+    SUMMARY = """
+[Parsed_ebur128_0 @ 0x1] t: 11.9  TARGET:-23 LUFS  M: -27.8 S: -27.8  I: -27.8 LUFS  LRA: 0.0 LU  TPK: -27.1 -27.1 dBFS
+[Parsed_ebur128_0 @ 0x1] Summary:
+
+  Integrated loudness:
+    I:         -19.4 LUFS
+    Threshold: -29.4 LUFS
+
+  Loudness range:
+    LRA:         3.7 LU
+
+  True peak:
+    Peak:      -2.5 dBFS
+"""
+
+    # The ordering change the scoping defends against: a progress line printed AFTER the
+    # summary. Scoping to the last `Summary:` alone does not exclude it, which is why the
+    # progress lines are also dropped by their `TARGET:` field.
+    TRAILING_PROGRESS = SUMMARY + (
+        "[Parsed_ebur128_0 @ 0x1] t: 12.0  TARGET:-23 LUFS  M: -40.0 S: -40.0  "
+        "I: -40.0 LUFS  LRA: 9.9 LU  TPK: -40.0 -40.0 dBFS\n"
+    )
+
+    def test_reads_the_summary_not_the_progress_lines(self):
+        parsed = _media_analysis_module._parse_loudness(self.SUMMARY)
+        self.assertEqual(parsed["integrated_lufs"], -19.4)
+        self.assertEqual(parsed["loudness_range_lu"], 3.7)
+        self.assertEqual(parsed["true_peak_dbtp"], -2.5)
+
+    def test_a_progress_line_after_the_summary_does_not_win(self):
+        parsed = _media_analysis_module._parse_loudness(self.TRAILING_PROGRESS)
+        self.assertEqual(parsed["integrated_lufs"], -19.4)
+        self.assertEqual(parsed["loudness_range_lu"], 3.7)
+        self.assertEqual(parsed["true_peak_dbtp"], -2.5)
+
+    def test_only_the_summary_block_is_read(self):
+        """The second half of the fix, pinned separately.
+
+        Dropping `TARGET:` lines removes the progress lines ffmpeg emits *today*. The
+        scoping enforces the broader invariant — nothing outside the summary block is a
+        measurement — which also covers an `I: ... LUFS` reaching stderr from anywhere
+        else. No current ffmpeg build produces the line below, so this is synthetic on
+        purpose: it tests the contract, not an observed format. Without the scoping it
+        reads -50.0 and reports a number that was never a programme measurement.
+        """
+        noise = self.SUMMARY + (
+            "[some_other_filter @ 0x3] I: -50.0 LUFS  LRA: 22.0 LU\n"
+        )
+        parsed = _media_analysis_module._parse_loudness(noise)
+        self.assertEqual(parsed["integrated_lufs"], -19.4)
+
+    def test_output_with_no_summary_yields_none_rather_than_a_frame_reading(self):
+        """No summary means no measurement. A progress line is not a fallback for one."""
+        progress_only = (
+            "[Parsed_ebur128_0 @ 0x1] t: 1.0  TARGET:-23 LUFS  M: -30.0 S: -30.0  "
+            "I: -30.0 LUFS  LRA: 1.0 LU  TPK: -30.0 -30.0 dBFS\n"
+        )
+        parsed = _media_analysis_module._parse_loudness(progress_only)
+        self.assertIsNone(parsed["integrated_lufs"])
+        self.assertIsNone(parsed["loudness_range_lu"])
+
+    def test_no_ebur128_output_at_all(self):
+        parsed = _media_analysis_module._parse_loudness("ffmpeg: no audio streams\n")
+        self.assertIsNone(parsed["integrated_lufs"])
+        self.assertIsNone(parsed["true_peak_dbtp"])
+
+    def test_matches_the_mix_plan_parser(self):
+        """Two parsers of one format; the duplication is only safe while they agree."""
+        from src.utils import mix_plan
+
+        for name, sample in (("summary", self.SUMMARY),
+                             ("trailing", self.TRAILING_PROGRESS)):
+            with self.subTest(sample=name):
+                theirs = mix_plan.parse_loudness(sample)
+                mine = _media_analysis_module._parse_loudness(sample)
+                for key in ("integrated_lufs", "loudness_range_lu", "true_peak_dbtp"):
+                    self.assertEqual(mine[key], theirs[key], f"{name}/{key}")
 
 
 if __name__ == "__main__":

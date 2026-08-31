@@ -1935,6 +1935,57 @@ class AttributeReadingTests(unittest.TestCase):
                          "absent")
         self.assertIn("get_attribute", rbo.ResolveOperations.OPERATIONS)
 
+    def test_a_fusion_object_reaches_its_own_unenumerated_methods(self) -> None:
+        """Fusion under-reports itself, and unlike Resolve it cannot be probed.
+
+        `dir()` on a live Fusion Tool omits GetAttrs/SetAttrs — documented
+        methods that work perfectly when called (measured on free 21.0.3.7:
+        GetAttrs returned TOOLS_Name "Blur1"). Because Resolve fabricates a
+        callable for any name, dir() is the only evidence of absence there is,
+        so an omitted name can only be recovered by knowing about it.
+
+        The stub overrides __dir__ rather than just seeding the method cache:
+        the proxy re-fetches the list before declaring absence, so a stub whose
+        dir() still shows GetAttrs makes this test pass with the fix removed.
+
+        Without this, `fusion_comp add_tool` — which calls GetAttrs to build its
+        return value — died on the free edition and took every server-authored
+        Fusion graph with it.
+        """
+        class FusionToolLike:
+            """Callable GetAttrs, invisible to dir() — what Fusion actually does."""
+
+            def ConnectInput(self, *a): return True
+            def FindMainInput(self, *a): return None
+            def GetControlPageNames(self): return []
+            def SetInput(self, *a): return True
+            def GetAttrs(self): return {"TOOLS_Name": "Blur1", "TOOLS_RegID": "Blur"}
+
+            def __dir__(self):
+                return ["ConnectInput", "FindMainInput", "GetControlPageNames", "SetInput"]
+
+        tool, _ = self._serve(FusionToolLike())
+        self.assertNotIn("GetAttrs", tool._methods(refresh=True))
+        self.assertEqual(tool.GetAttrs(), {"TOOLS_Name": "Blur1", "TOOLS_RegID": "Blur"})
+
+    def test_resolve_objects_still_refuse_an_absent_method(self) -> None:
+        """The exception above must not become a hole in capability detection.
+
+        A Resolve API object has none of the Fusion markers, so GetAttrs stays
+        absent there — and an invented name stays absent on the Fusion object
+        too. This is what keeps `getattr(item, "CreateMagicMask", None)` honest.
+        """
+        resolve, _ = self._serve(self.RemoteLike())
+        self.assertFalse(hasattr(resolve, "GetAttrs"))
+
+        class FusionToolLike:
+            def ConnectInput(self, *a): return True
+            def GetAttrs(self): return {}
+            def __dir__(self): return ["ConnectInput"]
+
+        tool, _ = self._serve(FusionToolLike())
+        self.assertFalse(hasattr(tool, "Xyzzy_NotAFusionMethod"))
+
     def test_private_names_are_refused_here_too(self) -> None:
         from src.utils import resolve_bridge_ops as rbo
 
@@ -2516,3 +2567,58 @@ class BridgePortConflictTests(unittest.TestCase):
         self.assertIn("still running from an earlier Resolve session", message)
         self.assertIn("shutdown", message)
         self.assertIn(str(port), message)
+
+
+class BoundMethodKeywordTests(unittest.TestCase):
+    """Bridge method proxies are positional-only; a kwarg must fail with
+    guidance, not the bare "unexpected keyword argument" that shipped a
+    black-box error to a PR #165 reporter."""
+
+    def test_keyword_argument_raises_with_remediation(self):
+        from src.utils.resolve_bridge_client import _BoundMethod
+
+        method = _BoundMethod(transport=None, handle="h1", name="StartRendering")
+        with self.assertRaises(TypeError) as raised:
+            method([1], isInteractiveMode=False)
+        message = str(raised.exception)
+        self.assertIn("StartRendering", message)
+        self.assertIn("isInteractiveMode", message)
+        self.assertIn("positionally", message)
+
+    def test_no_resolve_api_call_uses_keyword_arguments(self):
+        """PR #165's bug class, guarded for ALL bridge-reachable code.
+
+        The bridge proxies Resolve calls positionally, so a keyword argument
+        on any Resolve API method works on Studio's native scripting and dies
+        on the free edition. The Resolve method-name set comes from the shipped
+        API reference, which is what separates StartRendering from Popen — a
+        PascalCase heuristic alone flags every stdlib constructor in the tree.
+        The first sweep found the bug a second time, in probe_catalogue.py.
+        """
+        import ast
+        import pathlib
+        import re
+
+        root = pathlib.Path(__file__).resolve().parent.parent
+        api_doc = (root / "docs" / "reference" / "resolve_scripting_api.txt").read_text()
+        api_methods = set(re.findall(r"^\s{2}([A-Z][A-Za-z0-9]+)\(", api_doc, re.M))
+        self.assertGreater(len(api_methods), 100, "API doc parse looks broken")
+
+        offenders = []
+        for path in sorted((root / "src").rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                    continue
+                if node.func.attr in api_methods and node.keywords:
+                    kw = ", ".join(k.arg or "**" for k in node.keywords)
+                    offenders.append(
+                        f"{path.relative_to(root)}:{node.lineno} "
+                        f"{node.func.attr}({kw}=...)"
+                    )
+        self.assertEqual(
+            offenders, [],
+            "Resolve API calls must be positional — a keyword argument dies in "
+            "the free-edition bridge's _BoundMethod (PR #165). Rewrite these "
+            "positionally:\n  " + "\n  ".join(offenders),
+        )

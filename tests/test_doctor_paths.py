@@ -23,12 +23,17 @@ which has been in the field since v2.0 and is reported working on Windows.
 from __future__ import annotations
 
 import ast
+import json
 import sys
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
+if str(REPO) not in sys.path:
+    # The discovery tests below reach into src.utils; doctor itself does the
+    # same when run standalone.
+    sys.path.insert(0, str(REPO))
 
 import doctor  # noqa: E402
 
@@ -127,6 +132,125 @@ class PlatformDefaultsTests(unittest.TestCase):
             )
 
 
+class NonDefaultInstallDiscoveryTests(unittest.TestCase):
+    """Issue #158: Resolve installed off the conventional root.
+
+    The reporter had Resolve on `D:\\Programs\\DaVinci Resolve`. Every candidate
+    in the table missed, so doctor printed FAIL for a machine whose install
+    install.py had already located. Discovery is consulted only after the table
+    misses, so the existing "first existing candidate wins" behaviour above is
+    untouched.
+    """
+
+    def test_lib_falls_back_to_runtime_discovery(self) -> None:
+        from unittest import mock
+
+        import src.utils.platform as platform_utils
+
+        discovered = r"D:\Programs\DaVinci Resolve\fusionscript.dll"
+        with mock.patch.object(
+            doctor.Path, "exists", lambda self: str(self) == discovered
+        ), mock.patch.object(
+            platform_utils, "discover_scripting_lib", lambda *a, **k: discovered
+        ):
+            self.assertEqual(doctor._resolve_default("lib", "win32"), discovered)
+
+    def test_app_falls_back_to_the_running_process(self) -> None:
+        from unittest import mock
+
+        import src.utils.resolve_runtime as runtime
+
+        executable = r"D:\Programs\DaVinci Resolve\Resolve.exe"
+        with mock.patch.object(
+            doctor.Path, "exists", lambda self: str(self) == executable
+        ), mock.patch.object(
+            runtime, "resolve_processes", lambda: [f'"{executable}" -nogui']
+        ):
+            self.assertEqual(doctor._resolve_default("app", "win32"), executable)
+
+    def test_discovery_that_finds_nothing_still_names_the_canonical_path(self) -> None:
+        """A miss must not turn into a second guess — the FAIL line should keep
+        naming the location the user can go and check."""
+        from unittest import mock
+
+        import src.utils.platform as platform_utils
+
+        with mock.patch.object(doctor.Path, "exists", lambda self: False), \
+                mock.patch.object(platform_utils, "discover_scripting_lib", lambda *a, **k: None):
+            self.assertEqual(
+                doctor._resolve_default("lib", "win32"),
+                doctor._RESOLVE_PATH_CANDIDATES["win32"]["lib"][0],
+            )
+
+    def test_a_broken_discovery_helper_does_not_crash_the_diagnostic(self) -> None:
+        """doctor is what a user runs when things are already wrong. It must not
+        be the thing that raises."""
+        from unittest import mock
+
+        import src.utils.platform as platform_utils
+
+        def boom(*a, **k):
+            raise RuntimeError("no process table")
+
+        with mock.patch.object(doctor.Path, "exists", lambda self: False), \
+                mock.patch.object(platform_utils, "discover_scripting_lib", boom):
+            self.assertEqual(
+                doctor._resolve_default("lib", "win32"),
+                doctor._RESOLVE_PATH_CANDIDATES["win32"]["lib"][0],
+            )
+
+
+class EscapedPathMatchingTests(unittest.TestCase):
+    """Issue #158: doctor reported `missing` on configs it had just written.
+
+    A Windows path written into JSON comes back with its separators doubled, so
+    the literal substring test could never match. This is a false negative in a
+    tool whose whole job is telling the user whether setup worked.
+    """
+
+    def _write(self, text: str) -> Path:
+        import tempfile
+
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8"
+        )
+        handle.write(text)
+        handle.close()
+        self.addCleanup(lambda: Path(handle.name).unlink(missing_ok=True))
+        return Path(handle.name)
+
+    def test_json_escaped_windows_path_matches_its_unescaped_needle(self) -> None:
+        needle = r"C:\Users\sam\davinci-resolve-mcp\src\server.py"
+        path = self._write(json.dumps({"args": [needle]}))
+        # Round-tripping through json is the point: this is the escaping doctor
+        # reads back off disk, not a hand-written approximation of it.
+        self.assertIn("\\\\", path.read_text())
+        ok, detail = doctor.file_contains(path, [needle])
+        self.assertTrue(ok, detail)
+
+    def test_single_escaped_path_also_matches(self) -> None:
+        """TOML (Codex CLI) and hand-edited configs carry single backslashes."""
+        needle = r"C:\Users\sam\davinci-resolve-mcp\src\server.py"
+        path = self._write(f'command = "{needle}"')
+        ok, detail = doctor.file_contains(path, [needle])
+        self.assertTrue(ok, detail)
+
+    def test_a_genuinely_absent_entry_is_still_reported_missing(self) -> None:
+        """Normalizing separators must not soften the check into always-true."""
+        path = self._write(json.dumps({"args": [r"C:\Users\someone-else\server.py"]}))
+        ok, detail = doctor.file_contains(
+            path, [r"C:\Users\sam\davinci-resolve-mcp\src\server.py"]
+        )
+        self.assertFalse(ok)
+        self.assertIn("missing", detail)
+
+    def test_posix_paths_are_unaffected(self) -> None:
+        needle = "/Users/sam/davinci-resolve-mcp/src/server.py"
+        path = self._write(json.dumps({"args": [needle]}))
+        ok, detail = doctor.file_contains(path, [needle])
+        self.assertTrue(ok, detail)
+
+
 class InstallerDriftTests(unittest.TestCase):
     """doctor.py and install.py must not disagree about where Resolve lives."""
 
@@ -194,6 +318,74 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
             resolved,
             Path("~/Library/Application Support/Claude/claude_desktop_config.json").expanduser(),
         )
+
+
+class ResolveProbeLifecycleTests(unittest.TestCase):
+    def _layout(self, root: Path, helper: str, dvr: str) -> tuple[Path, Path]:
+        repo = root / "repo"
+        utils = repo / "src" / "utils"
+        modules = root / "modules"
+        utils.mkdir(parents=True)
+        modules.mkdir()
+        (repo / "src" / "__init__.py").write_text("")
+        (utils / "__init__.py").write_text("")
+        (utils / "resolve_connection.py").write_text(helper)
+        (modules / "DaVinciResolveScript.py").write_text(dvr)
+        return repo, modules
+
+    def test_bridge_first_skips_native_fusion_import(self) -> None:
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, modules = self._layout(
+                root,
+                "class Proxy:\n"
+                " def GetProductName(self): return 'Bridge Resolve'\n"
+                " def GetVersionString(self): return '1.0'\n"
+                "def connect_resolve(dvr):\n"
+                " assert dvr is None\n"
+                " return Proxy()\n",
+                "raise RuntimeError('native Fusion import must not happen')\n",
+            )
+            with mock.patch.object(doctor, "REPO", repo), mock.patch.object(
+                doctor, "RESOLVE_MODULES", modules
+            ), mock.patch.object(doctor, "PYTHON", Path(sys.executable)):
+                probe = doctor.resolve_probe()
+
+        self.assertTrue(probe["resolve_connected"])
+        self.assertTrue(probe["import_skipped"])
+        self.assertEqual(probe["transport"], "bridge")
+        self.assertEqual(probe["returncode"], 0)
+
+    def test_native_fallback_hard_exits_without_running_atexit(self) -> None:
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            finalized = root / "finalized.txt"
+            repo, modules = self._layout(
+                root,
+                "def connect_resolve(dvr):\n"
+                " return None if dvr is None else dvr.scriptapp('Resolve')\n",
+                "import atexit\nfrom pathlib import Path\n"
+                f"atexit.register(lambda: Path({str(finalized)!r}).write_text('ran'))\n"
+                "class Proxy:\n"
+                " def GetProductName(self): return 'Direct Resolve'\n"
+                " def GetVersionString(self): return '1.0'\n"
+                "def scriptapp(name): return Proxy()\n",
+            )
+            with mock.patch.object(doctor, "REPO", repo), mock.patch.object(
+                doctor, "RESOLVE_MODULES", modules
+            ), mock.patch.object(doctor, "PYTHON", Path(sys.executable)):
+                probe = doctor.resolve_probe()
+
+            self.assertTrue(probe["import_ok"])
+            self.assertTrue(probe["resolve_connected"])
+            self.assertEqual(probe["returncode"], 0)
+            self.assertFalse(finalized.exists(), "native probe ran Python finalizers")
 
 
 if __name__ == "__main__":

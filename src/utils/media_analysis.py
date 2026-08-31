@@ -200,6 +200,86 @@ def _annotate_clip_vision_failure(clip_result: Dict[str, Any], vision: Any) -> N
         })
 
 
+# Transcription statuses that mean "never attempted", as opposed to "attempted
+# and did not produce a transcript". Transcription is on by default
+# (DEFAULT_TRANSCRIPTION_ENABLED) and allow_model_download is off by default, so
+# a machine with no Whisper backend — or one that has simply not opted into model
+# downloads — reports "skipped" on every clip. Those are configuration states,
+# not clip failures, and counting them as failures fails every clip of every
+# batch on a default install.
+TRANSCRIPTION_UNATTEMPTED_STATUSES = frozenset({"skipped", "disabled", "not_implemented"})
+
+
+def transcription_attempt_failed(transcript: Any, *, enabled: bool) -> bool:
+    """True when requested transcription ran and still produced no transcript.
+
+    The vision counterpart is visual_analysis_completed, but vision defaults to
+    disabled, so it can treat every non-success as a failure. Transcription
+    defaults to enabled, so it has to separate "the backend refused to start" —
+    which is the normal state of an install without Whisper — from a real
+    failure such as a wall-clock timeout, a caps refusal, or a backend error.
+    """
+    if not enabled or not isinstance(transcript, dict):
+        return False
+    if transcript.get("success"):
+        return False
+    status = str(transcript.get("status") or "").strip().lower()
+    return status not in TRANSCRIPTION_UNATTEMPTED_STATUSES
+
+
+def transcription_options_would_attempt(transcription: Dict[str, Any]) -> bool:
+    """True when these options would actually run a transcription backend.
+
+    Mirrors _transcribe's early-outs. The local backends (whisper_cli,
+    mlx_whisper — also what a backend of None resolves to) refuse to run
+    without allow_model_download=true, whisper_cpp is not_implemented, and
+    the resolve backend is refused by design; mock and HTTP-provider
+    backends always attempt. Used by _report_missing_layers to decide
+    whether re-running an analysis could produce a transcript a cached
+    report lacks — if it could not, the cached report is as complete as a
+    fresh run would be. Known blind spot: backend None on a machine whose
+    only configured backend is an HTTP provider reports False here; name
+    the http_* backend explicitly to get cache invalidation.
+    """
+    backend = transcription.get("backend")
+    if backend in {"mock", "local_mock"}:
+        return True
+    if isinstance(backend, str) and backend.startswith(HTTP_TRANSCRIPTION_BACKEND_PREFIX):
+        return True
+    if backend in {"whisper_cpp", "resolve"}:
+        return False
+    return _coerce_bool(transcription.get("allow_model_download"), default=False)
+
+
+def _annotate_clip_transcript_failure(clip_result: Dict[str, Any], transcript: Any) -> None:
+    """Mark a clip failed when requested transcription did not complete.
+
+    execute_plan_async writes the analysis JSON and then hard-sets success True.
+    Vision already overwrites that via _annotate_clip_vision_failure; a
+    transcription timeout had no equivalent, so batch jobs counted an empty
+    transcript as succeeded. Callers gate on transcription_attempt_failed, which
+    keeps the "backend never ran" statuses out of the failure class.
+    """
+    status = ""
+    reason = ""
+    if isinstance(transcript, dict):
+        status = str(transcript.get("status") or "").strip()
+        reason = str(transcript.get("reason") or transcript.get("error") or "").strip()
+    if status == "wall_clock_timeout":
+        message = "Transcription timed out before a transcript was produced."
+        if reason:
+            message = f"{message} {reason}"
+    elif reason:
+        message = f"Transcription was requested but did not complete: {reason}"
+    else:
+        message = "Transcription was requested but did not complete."
+    clip_result.update({
+        "success": False,
+        "error": message,
+        "transcription": transcript,
+    })
+
+
 def _annotate_partial_success(manifest: Dict[str, Any]) -> None:
     """D3 — Mark batch manifests with explicit completed/failed clip-id lists.
 
@@ -2659,17 +2739,17 @@ def _ffmpeg_stderr_filter(path: str, video_filter: Optional[str] = None, audio_f
 
 
 def _parse_loudness(stderr: str) -> Dict[str, Any]:
-    def latest(pattern: str) -> Optional[float]:
-        matches = re.findall(pattern, stderr)
-        if not matches:
-            return None
-        return _parse_float(matches[-1])
+    """EBU R128 figures from ffmpeg's `ebur128` output.
 
-    return {
-        "integrated_lufs": latest(r"I:\s*(-?\d+(?:\.\d+)?)\s*LUFS"),
-        "loudness_range_lu": latest(r"LRA:\s*(-?\d+(?:\.\d+)?)\s*LU"),
-        "true_peak_dbtp": latest(r"Peak:\s*(-?\d+(?:\.\d+)?)\s*dBFS"),
-    }
+    Delegates to `loudness_parse`, which bounds the summary block rather than taking the
+    last match in the stream. `ebur128`'s per-frame progress lines carry their own `I:`,
+    `LRA:` and peak fields, so a last-match read is right only while the summary happens
+    to print last — and when it is not, the numbers still parse and a single frame is
+    reported as a programme measurement, with nothing to notice.
+    """
+    from src.utils import loudness_parse
+
+    return dict(loudness_parse.parse_loudness(stderr, to_float=_parse_float))
 
 
 def _parse_scene_changes(stderr: str) -> List[Dict[str, Any]]:
@@ -3609,7 +3689,19 @@ def _report_missing_layers(report: Dict[str, Any], depth: str, options: Dict[str
     if _coerce_bool(transcription.get("enabled"), default=DEFAULT_TRANSCRIPTION_ENABLED):
         transcript = report.get("transcription") or {}
         if not transcript.get("success") or transcript.get("status") == "skipped":
-            missing.append("transcription")
+            # A transcript-less report is a missing layer only when a re-run
+            # could supply the transcript: either the cached payload shows a
+            # real attempt that failed (a retry may fix a timeout), or the
+            # current options would now actually run a backend. Transcription
+            # is enabled by default while allow_model_download is not, so on a
+            # stock install every report carries a declined "skipped" payload —
+            # counting that as missing made every cached report reusable=False
+            # forever, silently defeating cache reuse with full re-analysis
+            # that could never produce the transcript either.
+            if transcription_attempt_failed(
+                transcript, enabled=True
+            ) or transcription_options_would_attempt(transcription):
+                missing.append("transcription")
     vision = options.get("vision") or {}
     if _coerce_bool(vision.get("enabled"), default=False):
         visual = report.get("visual") or {}
@@ -5697,6 +5789,13 @@ async def execute_plan_async(
             and not vision_pending
             and not visual_analysis_completed(vision)
         )
+        transcript_failed = transcription_attempt_failed(
+            transcript,
+            enabled=_coerce_bool(
+                (options.get("transcription") or {}).get("enabled"),
+                default=DEFAULT_TRANSCRIPTION_ENABLED,
+            ),
+        )
         frame_count = int(clip_plan.get("analysis_keyframe_budget") or 0)
         marker_plan = _build_clip_marker_plan(
             record,
@@ -5757,6 +5856,8 @@ async def execute_plan_async(
             manifest["vision_pending"] = True
         elif vision_failed:
             _annotate_clip_vision_failure(clip_result, vision)
+        if transcript_failed:
+            _annotate_clip_transcript_failure(clip_result, transcript)
         manifest["clips"].append(clip_result)
 
     manifest["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

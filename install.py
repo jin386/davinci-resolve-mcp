@@ -37,7 +37,7 @@ from src.utils.update_check import (
 
 # ─── Version ──────────────────────────────────────────────────────────────────
 
-VERSION = "2.98.2"
+VERSION = "2.132.1"
 # Only hard floor: mcp[cli] requires Python 3.10+. There is no upper bound —
 # Resolve's scripting bridge loads into newer interpreters on recent builds
 # (Python 3.14 verified against Resolve Studio 20.3.2). Older Resolve builds
@@ -284,6 +284,24 @@ def find_resolve_paths():
             lib_path = expanded
             break
 
+    if lib_path is None:
+        # The literal candidates above only cover a default install. An explicit
+        # override wins outright; failing that, ask where Resolve actually is.
+        # Skipping this is what wrote an empty RESOLVE_SCRIPT_LIB into working
+        # configs and left the server importing a DLL that was never there.
+        env_lib = os.environ.get("RESOLVE_SCRIPT_LIB")
+        if env_lib and os.path.isfile(env_lib):
+            lib_path = env_lib
+        else:
+            # Narrow except: an ImportError here means the helper is absent,
+            # which is a real answer. Anything else raised *inside* discovery is
+            # a defect and must not be laundered into "no library found".
+            try:
+                from src.utils.platform import discover_scripting_lib
+            except ImportError:
+                discover_scripting_lib = None
+            lib_path = discover_scripting_lib() if discover_scripting_lib else None
+
     return api_path, lib_path
 
 
@@ -375,6 +393,33 @@ def vscode_global_storage():
         return xdg_config() / "Code" / "User" / "globalStorage"
 
 
+def antigravity_config():
+    """Antigravity's MCP config path, resolved by what is on disk (issue #159).
+
+    Two contributors report two different locations and neither is verifiable
+    from here: 85afe82 added ~/.gemini/antigravity/mcp_config.json, and #159
+    reports ~/.gemini/config/mcp_config.json, with ~/.gemini/antigravity/ being
+    runtime state (logs, crash reports, brain state). Swapping one unverifiable
+    path for the other is a coin flip that breaks it for whoever was right, and
+    this repo has already been bitten by a documented-but-decoy config path
+    (Claude Desktop MSIX, issue #93).
+
+    So probe instead of choosing. ~/.gemini/config/ is checked first because
+    the installer has never written there — if that file exists, something else
+    created it, which is real evidence. ~/.gemini/antigravity/mcp_config.json
+    may exist merely because an earlier run of this installer put it there.
+    With neither present, fall back to ~/.gemini/config/ as #159 documents.
+    """
+    candidates = (
+        home() / ".gemini" / "config" / "mcp_config.json",
+        home() / ".gemini" / "antigravity" / "mcp_config.json",
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
 # Each client entry:
 #   id, name, config_path_fn, config_key, merge_strategy, notes
 # config_path_fn returns the path; config_key is the JSON key wrapping the server entry
@@ -384,7 +429,7 @@ MCP_CLIENTS = [
     {
         "id": "antigravity",
         "name": "Antigravity",
-        "get_path": lambda: home() / ".gemini" / "antigravity" / "mcp_config.json",
+        "get_path": antigravity_config,
         "config_key": "mcpServers",
         "notes": "Google's agentic AI coding assistant (VS Code fork)",
     },
@@ -520,7 +565,14 @@ def get_python_base_install(python_path):
 
 
 def build_server_env(python_path, api_path, lib_path, system=SYSTEM, python_home=None):
-    """Build the env block used by all generated stdio MCP configs."""
+    """Build the env block used by all generated stdio MCP configs.
+
+    Keys whose value is empty are omitted rather than written as "". An empty
+    `RESOLVE_SCRIPT_LIB` is worse than an absent one: it reads as configured in
+    the config file, while `DaVinciResolveScript.py` treats it as unset and
+    silently reverts to its own hardcoded install path — so a machine with
+    Resolve elsewhere fails with a DLL-load error that names nothing useful.
+    """
     api_value = str(api_path or "")
     lib_value = str(lib_path or "")
     env = {
@@ -528,6 +580,7 @@ def build_server_env(python_path, api_path, lib_path, system=SYSTEM, python_home
         "RESOLVE_SCRIPT_LIB": lib_value,
         "PYTHONPATH": str(Path(api_value) / "Modules") if api_value else "",
     }
+    env = {key: value for key, value in env.items() if value}
 
     if system == "Windows":
         env["PYTHONHOME"] = str(python_home or get_python_base_install(python_path))
@@ -1227,38 +1280,106 @@ def install_dependencies(venv_path, project_dir):
 
 # ─── Connection Verification ─────────────────────────────────────────────────
 
+#: Windows surfaces a hard access violation (STATUS_ACCESS_VIOLATION) as a
+#: process exit code. Both spellings appear in the wild: the unsigned value and
+#: the signed reading of the same 32 bits. The interpreter dies inside the
+#: native library, so there is no traceback and no stderr to report — without
+#: this translation the probe can only say "exited with code 3221225477",
+#: which is the shape issue #158 was reported as.
+WINDOWS_ACCESS_VIOLATION_CODES = (3221225477, -1073741819)
+
+
+def _version_parts(version):
+    """A `(major, minor, ...)` int tuple, or None if it cannot be read.
+
+    `is_abi_risk_python_version` unpacks `version[:2]`, so handing it the string
+    "3.13.3" yields `("3", ".")` and a quiet False — the interpreter most likely
+    to have caused the crash would be reported as not at risk. Normalizing here
+    means a caller cannot make that mistake by passing the obvious thing.
+    """
+    if version is None:
+        return None
+    if isinstance(version, str):
+        try:
+            return tuple(int(part) for part in version.split(".")[:3])
+        except ValueError:
+            return None
+    try:
+        return tuple(int(part) for part in tuple(version)[:3])
+    except (TypeError, ValueError):
+        return None
+
+
+def access_violation_message(returncode, version=None):
+    """Explain an access-violation exit, naming the ABI theory when it fits."""
+    text = (
+        "Python crashed with an access violation (0xC0000005) while loading "
+        "Resolve's scripting library — no traceback is possible, the process "
+        "was terminated by the OS."
+    )
+    parts = _version_parts(version)
+    if parts is None or is_abi_risk_python_version(parts):
+        text += (
+            " This is the signature of a C ABI mismatch: recreate the venv on "
+            "Python 3.10-3.12 (e.g. DAVINCI_RESOLVE_MCP_PYTHON=...\\python3.12.exe)."
+        )
+    else:
+        text += " Check that RESOLVE_SCRIPT_LIB names the library from your Resolve install."
+    return text
+
+
 def verify_resolve_connection(python_path, api_path, lib_path):
-    """Try to import DaVinciResolveScript and connect."""
+    """Probe Resolve without exposing short-lived children to Fusion teardown.
+
+    The persistent bridge is tried before Blackmagic's native scripting module.
+    If direct scripting is genuinely required, the disposable child flushes its
+    result and hard-exits after any native import attempt so fusionscript's
+    background RemoteApp thread cannot race CPython finalization.
+    """
     if not api_path:
         return False, "Resolve API path not found"
 
     env = {**os.environ, **build_server_env(python_path, api_path, lib_path)}
     modules_path = env["PYTHONPATH"]
     repo_root = str(Path(__file__).resolve().parent)
-    # Route through connect_resolve so Network mode (RESOLVE_SCRIPT_HOST, propagated
-    # into env by build_server_env) uses the explicit IP-targeted overload. Fall
-    # back to Local-mode discovery if the helper cannot be imported.
     test_script = textwrap.dedent(f"""\
+        import os
         import sys
         sys.path.insert(0, {modules_path!r})
         sys.path.insert(0, {repo_root!r})
+        native_import_attempted = False
         try:
-            import DaVinciResolveScript as dvr
             try:
                 from src.utils.resolve_connection import connect_resolve
             except Exception:
-                connect_resolve = lambda mod: mod.scriptapp('Resolve')
-            resolve = connect_resolve(dvr)
+                connect_resolve = None
+
+            resolve = None
+            if connect_resolve is not None:
+                resolve = connect_resolve(None)
+
+            if resolve is None:
+                native_import_attempted = True
+                import DaVinciResolveScript as dvr
+                if connect_resolve is not None:
+                    resolve = connect_resolve(dvr)
+                else:
+                    resolve = dvr.scriptapp('Resolve')
+
             if resolve:
                 name = resolve.GetProductName()
                 ver = resolve.GetVersionString()
-                print(f"CONNECTED: {{name}} {{ver}}")
+                print(f"CONNECTED: {{name}} {{ver}}", flush=True)
             else:
-                print("IMPORTED_OK: Module loads but Resolve not running or not responding")
+                print("IMPORTED_OK: Module loads but Resolve not running or not responding", flush=True)
         except ImportError as e:
-            print(f"IMPORT_ERROR: {{e}}")
+            print(f"IMPORT_ERROR: {{e}}", flush=True)
         except Exception as e:
-            print(f"ERROR: {{e}}")
+            print(f"ERROR: {{e}}", flush=True)
+        if native_import_attempted:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
     """)
 
     process_timeout = 10.0
@@ -1285,6 +1406,12 @@ def verify_resolve_connection(python_path, api_path, lib_path):
         elif output.startswith("IMPORTED_OK:"):
             return True, "API module loaded (Resolve not running)"
         else:
+            if result.returncode in WINDOWS_ACCESS_VIOLATION_CODES:
+                try:
+                    version = _version_for_python(python_path)
+                except Exception:
+                    version = None
+                return False, access_violation_message(result.returncode, version)
             if output:
                 return False, output
             return False, f"Process exited with code {result.returncode}"
@@ -1292,6 +1419,7 @@ def verify_resolve_connection(python_path, api_path, lib_path):
         return False, "Connection timed out"
     except Exception as e:
         return False, str(e)
+
 
 # ─── Interactive UI ───────────────────────────────────────────────────────────
 
@@ -1921,7 +2049,13 @@ def main():
     if lib_path:
         print(f"  Library:   {green(lib_path)}")
     else:
-        print(f"  Library:   {yellow('Not found')} {dim('(optional — API path is sufficient)')}")
+        # Not optional, whatever this line used to claim: DaVinciResolveScript
+        # is a thin wrapper that loads this binary, so without it every tool
+        # fails at import. Saying "API path is sufficient" here sent people
+        # looking at their Resolve edition and their preferences instead.
+        print(f"  Library:   {red('Not found')} {dim('(required — the scripting API cannot load without it)')}")
+        print(f"  {dim('Set RESOLVE_SCRIPT_LIB to the fusionscript library inside your Resolve install,')}")
+        print(f"  {dim('or start Resolve and re-run setup so its location can be read from the process.')}")
 
     resolve_running = check_resolve_running()
     if resolve_running:
@@ -2122,6 +2256,7 @@ def main():
     if interactive:
         print_step(5, total_steps, "Verification")
 
+    verification_failed = False
     if api_path:
         success, message = verify_resolve_connection(python_path, api_path, lib_path)
         try:
@@ -2171,13 +2306,31 @@ def main():
             else:
                 print(f"  Connected: {green(message)}")
         else:
-            print(f"  Verify:    {yellow(message)}")
-            if py_abi_risk:
+            verification_failed = True
+            print(f"  Verify:    {red(message)}")
+            if "DLL load failed" in message or "cannot open shared object" in message:
+                # This is the shape of a wrong or missing library path, and it
+                # is the one failure the installer can diagnose precisely. Say
+                # so before offering the interpreter theory below — a reader who
+                # is told "try another Python" first will go and do that.
+                print(
+                    f"             The scripting library named by RESOLVE_SCRIPT_LIB did not load. "
+                    f"Current value: {lib_path or dim('(not set)')}"
+                )
+                print(
+                    "             Point RESOLVE_SCRIPT_LIB at the fusionscript library inside your "
+                    "Resolve install, or start Resolve and re-run setup."
+                )
+            if py_abi_risk and "0xC0000005" not in message:
+                # The access-violation message already carries this remedy, and
+                # states it as a diagnosis rather than a maybe. Do not follow it
+                # with a weaker restatement of itself.
                 print(
                     f"             On Python 3.13+ this may be an ABI mismatch with Resolve's "
                     f"scripting library — try Python 3.10-3.12 if it persists."
                 )
     else:
+        verification_failed = True
         print(f"  {yellow('Skipped')} — Resolve API path not detected")
 
     # ══════════════════════════════════════════════════════════════════════
@@ -2185,7 +2338,25 @@ def main():
     # ══════════════════════════════════════════════════════════════════════
 
     print(f"\n  {'═' * 50}")
-    if configured or show_manual:
+    if verification_failed and (configured or show_manual):
+        # Writing the configs is not the job; a working connection is. Reporting
+        # "Setup complete!" over a failed verification is how an install that
+        # never worked gets handed to the user as finished — the error scrolls
+        # past mid-output and the last line says success.
+        print(f"  {yellow(bold('Setup incomplete — the scripting API did not load.'))}")
+        if configured:
+            print(f"  Configured: {', '.join(configured)} {dim('(written, but the server will fail to start)')}")
+        print()
+        print(f"  {bold('Fix the verification error above, then re-run:')}")
+        print(f"    {cyan('python install.py')}")
+        print()
+        print(f"  {dim(f'Server: {server_path}')}")
+        print(f"  {dim(f'Python: {python_path}')}")
+        if api_path:
+            print(f"  {dim(f'API:    {api_path}')}")
+        if lib_path:
+            print(f"  {dim(f'Library: {lib_path}')}")
+    elif configured or show_manual:
         print(f"  {green(bold('Setup complete!'))}")
         if configured:
             print(f"  Configured: {', '.join(configured)}")
@@ -2204,18 +2375,32 @@ def main():
         if api_path:
             print(f"  {dim(f'API:    {api_path}')}")
     elif not selected_ids:
-        print(f"  {green(bold('Environment ready!'))}")
-        print(f"  Run {cyan('python install.py --clients all')} to configure MCP clients later.")
+        # Same rule as the configured branch above: a failed verification is
+        # never "ready". Nothing was written here, so the remedy is the error
+        # itself rather than a re-run to fix a config.
+        if verification_failed:
+            print(f"  {yellow(bold('Environment incomplete — the scripting API did not load.'))}")
+            print(f"  {dim('No client configs were written.')}")
+            print()
+            print(f"  {bold('Fix the verification error above, then re-run:')}")
+            print(f"    {cyan('python install.py')}")
+        else:
+            print(f"  {green(bold('Environment ready!'))}")
+            print(f"  Run {cyan('python install.py --clients all')} to configure MCP clients later.")
     else:
         print(f"  {yellow('No clients configured.')}")
         print(f"  Run {cyan('python install.py')} again to retry.")
 
     print()
+    # Exit status has to agree with the summary line above. `npx
+    # davinci-resolve-mcp setup` is run from scripts and CI, where a zero over a
+    # dead install is the same lie as "Setup complete!" was.
+    return 1 if verification_failed else 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main() or 0)
     except KeyboardInterrupt:
         print(f"\n\n  {dim('Interrupted.')}\n")
         sys.exit(1)

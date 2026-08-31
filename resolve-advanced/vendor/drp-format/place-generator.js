@@ -9,7 +9,10 @@
  *
  * Clone-based: carry the bundled Solid Color template and swap PrettyType/Name/Start/
  * Duration + a fresh DbId. The same Sm2TiGenerator shape serves the other simple built-in
- * generators by changing PrettyType (verify per type before relying on it).
+ * generators by changing PrettyType — RENDER-VERIFIED on Studio 19.1.3.7 (2026-08-30):
+ * Solid Color YAVG 16 over white 234, SMPTE Color Bar 104.9, Grey Scale 125.1, all from a
+ * fully offline-authored .drt. Unlike Fusion titles, Sm2TiGenerator has no comp blob, so
+ * the byte-keyed Fusion render-cache law does NOT apply: generators render live everywhere.
  *
  * @module drp-format/place-generator
  */
@@ -28,6 +31,12 @@ const {
 } = require('./seq-surgery');
 
 const TEMPLATE_PATH = path.join(__dirname, 'templates', 'generator-solid-color.xml');
+const TEMPLATE_PATH_R19 = path.join(__dirname, 'templates', 'generator-solid-color-r19.xml');
+// Generation-bound like every other harvested structure (R21 snippet renders
+// black on 19 — measured); r19 variant harvested live from 19.1.3.7.
+function snippetPathFor(templateVersion) {
+  return (Number(templateVersion) || 21) >= 21 ? TEMPLATE_PATH : TEMPLATE_PATH_R19;
+}
 
 /**
  * Place a built-in generator on a chosen video track.
@@ -43,7 +52,7 @@ const TEMPLATE_PATH = path.join(__dirname, 'templates', 'generator-solid-color.x
  *   generatorName:string, videoTrackCount:number, createdTracks:number}>}
  */
 async function placeGenerator(drpInput, opts = {}) {
-  const { generatorName = 'Solid Color', trackIndex = 2, startFrame, durationFrames = 120, timelineUuid } = opts;
+  const { generatorName = 'Solid Color', trackIndex = 2, startFrame, durationFrames = 120, timelineUuid, templateVersion } = opts;
   if (!Number.isInteger(startFrame)) throw new TypeError('placeGenerator: startFrame (int) is required');
   if (!Number.isInteger(trackIndex) || trackIndex < 1) throw new TypeError('placeGenerator: trackIndex must be a positive integer');
   if (/[<>]/.test(generatorName)) throw new Error('placeGenerator: generatorName must not contain < or >');
@@ -51,7 +60,7 @@ async function placeGenerator(drpInput, opts = {}) {
   const zip = await loadDrpZip(drpInput);
   const { entry, xml: seqXml, seqId } = await selectTargetSeq(zip, timelineUuid);
 
-  let gen = fs.readFileSync(TEMPLATE_PATH, 'utf8').trim();
+  let gen = fs.readFileSync(snippetPathFor(templateVersion), 'utf8').trim();
   gen = freshDbIds(gen);
   gen = gen.replace(/<PrettyType>[\s\S]*?<\/PrettyType>/, `<PrettyType>${escapeXml(generatorName)}</PrettyType>`);
   gen = gen.replace(/<Name>[\s\S]*?<\/Name>/, `<Name>${escapeXml(generatorName)}</Name>`);

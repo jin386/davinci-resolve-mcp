@@ -95,13 +95,64 @@ def _platform_key(platform: str | None = None) -> str:
     return "linux"
 
 
+def _discovered_default(kind: str) -> str | None:
+    """Ask the runtime helpers where Resolve actually is.
+
+    The candidate table above is a table of *conventional* locations. Resolve is
+    routinely installed somewhere else — a second drive is the common case,
+    because the application and its caches are large (issue #158 reported
+    `D:\\Programs\\DaVinci Resolve`). install.py already looks past the table
+    via these helpers; doctor did not, so it reported FAIL on installs the
+    installer had just configured correctly. That disagreement between two tools
+    describing one machine is the same failure shape as issue #106.
+
+    Only consulted when no candidate exists, and only for the two kinds the
+    helpers can answer. `api` has no discovery helper, so a non-default install
+    can still miss there — worth knowing when reading a report.
+    """
+    if str(REPO) not in sys.path:
+        # doctor is run standalone (`python scripts/doctor.py`) as often as it is
+        # run through the launcher, and only the latter puts the repo on the path.
+        sys.path.insert(0, str(REPO))
+
+    if kind == "lib":
+        try:
+            from src.utils.platform import discover_scripting_lib
+        except Exception:
+            return None
+        try:
+            discovered = discover_scripting_lib()
+        except Exception:
+            return None
+        return str(discovered) if discovered and Path(discovered).exists() else None
+
+    if kind == "app":
+        try:
+            from src.utils.resolve_runtime import _executable_from_line, resolve_processes
+        except Exception:
+            return None
+        try:
+            processes = resolve_processes() or []
+        except Exception:
+            return None
+        for line in processes:
+            executable = _executable_from_line(line)
+            if executable and Path(executable).exists():
+                return str(executable)
+    return None
+
+
 def _resolve_default(kind: str, platform: str | None = None) -> str:
-    """First candidate of `kind` that exists, else the first (so the FAIL line
-    names the canonical location rather than an arbitrary miss)."""
+    """First candidate of `kind` that exists, then discovery, else the first
+    candidate (so the FAIL line names the canonical location rather than an
+    arbitrary miss)."""
     candidates = _RESOLVE_PATH_CANDIDATES[_platform_key(platform)][kind]
     for candidate in candidates:
         if Path(candidate).exists():
             return candidate
+    discovered = _discovered_default(kind)
+    if discovered:
+        return discovered
     return candidates[0]
 
 
@@ -170,11 +221,27 @@ def check(results: list[dict[str, str]], status: str, name: str, detail: str) ->
     results.append({"status": status, "name": name, "detail": detail})
 
 
+def _normalize_separators(text: str) -> str:
+    r"""Collapse every run of backslashes to a single forward slash.
+
+    A Windows path does not survive a literal substring test against the file it
+    was written into: JSON escapes `C:\Users\x` as `C:\\Users\\x`, and TOML
+    may keep it single-escaped or write a literal string. doctor compared the
+    unescaped path against the raw file text and so reported the entry missing
+    on configs it had itself just written (issue #158).
+
+    Collapsing runs — rather than only the doubled form — is what makes both
+    spellings compare equal, and normalizing the needle the same way keeps the
+    comparison symmetric.
+    """
+    return re.sub(r"\\+", "/", text)
+
+
 def file_contains(path: Path, needles: list[str]) -> tuple[bool, str]:
     if not path.exists():
         return False, "missing"
-    text = path.read_text(errors="replace")
-    missing = [needle for needle in needles if needle not in text]
+    text = _normalize_separators(path.read_text(errors="replace"))
+    missing = [needle for needle in needles if _normalize_separators(needle) not in text]
     if missing:
         return False, "missing: " + ", ".join(missing)
     return True, "contains davinci-resolve MCP entry"
@@ -208,35 +275,71 @@ def resolve_probe(
     if not PYTHON.exists():
         return {"import_ok": False, "error": f"{PYTHON} is missing"}
 
+    # Disposable probe: ask the persistent bridge before importing Blackmagic's
+    # native Fusion module. fusionscript can leave a RemoteApp thread alive and
+    # crash CPython during interpreter finalization. If native import is needed,
+    # flush the result and hard-exit so those unsafe finalizers never run.
     code = f"""
 import json
+import os
 import sys
 sys.path.insert(0, {str(REPO)!r})
 sys.path.insert(0, {str(RESOLVE_MODULES)!r})
+native_import_attempted = False
 try:
-    import DaVinciResolveScript as dvr
     from src.utils.resolve_connection import connect_resolve
 except Exception as exc:
     payload = {{"import_ok": False, "error": repr(exc)}}
 else:
     try:
-        resolve = connect_resolve(dvr)
+        resolve = connect_resolve(None)
     except Exception as exc:
         payload = {{
-            "import_ok": True,
-            "module": getattr(dvr, "__file__", None),
+            "import_ok": None,
+            "import_skipped": True,
             "resolve_connected": False,
             "connection_error": repr(exc),
         }}
     else:
-        payload = {{
-            "import_ok": True,
-            "module": getattr(dvr, "__file__", None),
-            "resolve_connected": bool(resolve),
-            "product": resolve.GetProductName() if resolve else None,
-            "version": resolve.GetVersionString() if resolve else None,
-        }}
-print(json.dumps(payload))
+        if resolve is not None:
+            payload = {{
+                "import_ok": None,
+                "import_skipped": True,
+                "module": None,
+                "resolve_connected": True,
+                "transport": "bridge",
+                "product": resolve.GetProductName(),
+                "version": resolve.GetVersionString(),
+            }}
+        else:
+            native_import_attempted = True
+            try:
+                import DaVinciResolveScript as dvr
+            except Exception as exc:
+                payload = {{"import_ok": False, "error": repr(exc)}}
+            else:
+                try:
+                    resolve = connect_resolve(dvr)
+                except Exception as exc:
+                    payload = {{
+                        "import_ok": True,
+                        "module": getattr(dvr, "__file__", None),
+                        "resolve_connected": False,
+                        "connection_error": repr(exc),
+                    }}
+                else:
+                    payload = {{
+                        "import_ok": True,
+                        "module": getattr(dvr, "__file__", None),
+                        "resolve_connected": bool(resolve),
+                        "product": resolve.GetProductName() if resolve else None,
+                        "version": resolve.GetVersionString() if resolve else None,
+                    }}
+print(json.dumps(payload), flush=True)
+if native_import_attempted:
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 """
     env = {
         **os.environ,
@@ -414,36 +517,46 @@ def collect(
     check(results, "OK" if pyver["ok"] else "FAIL", "Python version", pyver["stdout"] or pyver["stderr"])
 
     probe = resolve_probe(resolve_host, resolve_timeout)
-    if probe.get("import_ok"):
+    if probe.get("import_skipped"):
+        check(
+            results,
+            "OK" if probe.get("resolve_connected") else "INFO",
+            "DaVinciResolveScript import",
+            "skipped — persistent bridge answered; native Fusion module not loaded"
+            if probe.get("resolve_connected")
+            else "skipped — bridge mode failed before native Fusion import",
+        )
+    elif probe.get("import_ok"):
         check(results, "OK", "DaVinciResolveScript import", str(probe.get("module")))
-        if probe.get("resolve_connected"):
-            detail = f"{probe.get('product')} {probe.get('version')}"
-            check(results, "OK", "Resolve scripting connection", detail)
-        elif probe.get("connection_error"):
-            check(
-                results,
-                "FAIL",
-                "Resolve scripting connection",
-                str(probe["connection_error"]),
-            )
-        else:
-            # This is also exactly what the free edition looks like: the module
-            # imports fine and scriptapp refuses, because Blackmagic gates
-            # *external* scripting to Studio. Sending someone to toggle a
-            # preference that cannot help them is a dead end, so name the bridge
-            # here too.
-            check(
-                results,
-                "WARN",
-                "Resolve scripting connection",
-                "Module import worked, but scriptapp returned no object. On Studio: "
-                "External scripting = Local, or Network with --resolve-host set to "
-                "the Resolve host IP, then restart Resolve. On the FREE edition "
-                "external scripting is gated off entirely — use the in-app bridge "
-                "(see 'Free-edition bridge' below).",
-            )
     else:
         check(results, "FAIL", "DaVinciResolveScript import", str(probe.get("error")))
+
+    if probe.get("resolve_connected"):
+        detail = f"{probe.get('product')} {probe.get('version')}"
+        check(results, "OK", "Resolve scripting connection", detail)
+    elif probe.get("connection_error"):
+        check(
+            results,
+            "FAIL",
+            "Resolve scripting connection",
+            str(probe["connection_error"]),
+        )
+    elif probe.get("import_ok"):
+        # This is also exactly what the free edition looks like: the module
+        # imports fine and scriptapp refuses, because Blackmagic gates
+        # *external* scripting to Studio. Sending someone to toggle a
+        # preference that cannot help them is a dead end, so name the bridge
+        # here too.
+        check(
+            results,
+            "WARN",
+            "Resolve scripting connection",
+            "Module import worked, but scriptapp returned no object. On Studio: "
+            "External scripting = Local, or Network with --resolve-host set to "
+            "the Resolve host IP, then restart Resolve. On the FREE edition "
+            "external scripting is gated off entirely — use the in-app bridge "
+            "(see 'Free-edition bridge' below).",
+        )
 
     results.extend(bridge_checks(probe))
 
